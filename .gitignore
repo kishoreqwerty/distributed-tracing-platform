@@ -1,0 +1,18 @@
+# Go
+/collector/collector
+/writer/writer
+/loadgen/loadgen
+*.test
+
+# Node
+node_modules/
+dashboard/dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# OS
+.DS_Store
