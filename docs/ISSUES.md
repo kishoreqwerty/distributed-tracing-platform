@@ -88,6 +88,26 @@ inheriting the run's deadline. The outer ticker/duration still governs
 when loadgen stops *initiating* new sends; an already-in-flight send is no
 longer aborted by the run ending.
 
+**Why this is worth naming as a general class, not a one-off:** a
+client-side timeout firing after the server has already durably completed
+the work is not specific to gRPC, or to loadgen, or to this pipeline — it's
+inherent to any request/response call with a client-enforced deadline
+shorter than (or racing) the server's actual completion time. The failure
+signature is deceptively clean: the client sees an error, so it correctly
+does *not* count the operation as successful — but "not counted as
+successful by the client" and "didn't happen" are different claims, and
+it's easy to conflate them. Here that conflation would have shown up as a
+phantom data-loss report: ClickHouse had more spans than loadgen "sent,"
+and a naive read of that gap is "the pipeline is duplicating or the count
+is wrong," when the actual story is "the count was always an undercount of
+a system that worked correctly." Any monitoring, alerting, or test
+assertion built on a caller's self-reported success count — not just here,
+generally — needs to treat that count as a lower bound on work actually
+done, not an exact figure, unless the caller and the system it's calling
+agree on idempotency and the caller retries (or otherwise reconciles)
+on timeout rather than just logging and moving on the way this loadgen did
+before the fix.
+
 ### Integration test read a stale consumer-lag gauge right after recovery
 
 **Symptom:** `TestClickHouseOutageBackpressureAndRecovery` failed with

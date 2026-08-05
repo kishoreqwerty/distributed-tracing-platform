@@ -11,29 +11,51 @@ writer does not consume). Nothing to benchmark.
 
 ## Phase 1 — Collector -> Kafka -> Writer -> ClickHouse
 
-No formal throughput/latency benchmark has been run yet — these are informal
-numbers pulled from `/metrics` during manual smoke testing and the
-integration test suite, not a dedicated load test. Treat them as
-"the pipeline works and roughly how fast," not a capacity claim.
+Still not a dedicated load test — no attempt yet to find a breaking point
+or a max sustained rate (that's explicitly Phase 6's job). These are real
+numbers pulled from `/metrics` (via Prometheus `histogram_quantile`) during
+a single baseline run: `loadgen --target collector:4317 --rate 100
+--duration 30s` against a freshly started `docker compose up` stack.
 
+### Baseline run: `--rate 100 --duration 30s`
+
+- **Spans sent vs. landed:** 11,910 spans sent by loadgen (2,969 traces);
+  11,910 rows in ClickHouse, both raw (`count()`) and deduped
+  (`count() ... FINAL`) — **zero duplicates, zero span loss.**
+  `writer_flush_errors_total` = 0 for the whole run.
+- **Sustained ingest throughput:** 11,910 spans / 30s ≈ **397 spans/sec**,
+  collector to ClickHouse, sustained for the full run (this is a
+  measurement of this one run, not a claimed ceiling — see Phase 6).
 - **Collector publish latency** (`collector_publish_duration_seconds`,
-  produce call to broker ack), one smoke-test run of 765 spans at a modest
-  rate (loadgen `--rate 20 --duration 10s`): 719/765 (94%) under 5ms, all
-  765 under 500ms, mean ≈ 8.2ms. All spans in this run published
-  successfully — 0 `collector_publish_errors_total`.
+  produce call to broker ack): p50 ≈ 2.6ms, p99 ≈ 34.5ms.
 - **Writer flush duration** (`writer_flush_duration_seconds`, ClickHouse
-  batch insert), same run: 5 flushes, mean ≈ 5.2ms/flush, batch sizes
-  51-224 rows (time-triggered, not size-triggered — see `DECISIONS.md`'s
-  batch-flush-policy row).
-- **ClickHouse-outage recovery**: consumer lag rose to ~2510 spans across 4
-  partitions during a sustained manual outage and returned to 0 within one
-  `WRITER_LAG_REPORT_PERIOD` (5s) tick after ClickHouse came back; writer
-  RSS stayed flat at ~12MiB throughout (see `docs/ISSUES.md` and the Phase
-  1 report for the full run).
-- Ingest throughput (spans/sec) sustained by the collector: not measured —
-  no sustained load test run yet.
+  batch insert): 10 flushes total, p50 ≈ 6.4ms, p99 ≈ 9.9ms.
+- **Batch size** (`writer_batch_size`): mean 1,191 rows/flush (11,910 rows
+  / 10 flushes), p50 ≈ 1,368, p99 ≈ 2,477. Every flush in this run was
+  **time-triggered** (the 2-second bound), not size-triggered — none came
+  close to the 5,000-row size bound. See "Known gap" below.
+- **ClickHouse-outage recovery** (separate run, ClickHouse stopped mid-run):
+  consumer lag rose to ~2,510 spans across 4 partitions during a sustained
+  manual outage and returned to 0 within one `WRITER_LAG_REPORT_PERIOD`
+  (5s) tick after ClickHouse came back; writer RSS stayed flat at ~12MiB
+  throughout (see `docs/ISSUES.md`).
 - End-to-end latency (emit -> queryable in ClickHouse), p50/p95/p99: not
-  measured.
+  measured — would need a per-span emit timestamp threaded through to a
+  ClickHouse query, which nothing here currently does.
+
+### Known gap: the size-triggered flush path is untested end to end
+
+`WRITER_BATCH_MAX_SIZE` defaults to 5,000 rows and `WRITER_FLUSH_INTERVAL`
+to 2 seconds. For the size bound to ever fire *before* the time bound,
+sustained arrival has to exceed 5,000 rows / 2s = **2,500 spans/sec** — 
+roughly 6.3x the 397 spans/sec this baseline run sustained. Nothing run so
+far, including this baseline, has come anywhere near that. Consequently the
+size-triggered branch of `batcher.Add`'s `shouldFlush` return is only
+unit-tested in isolation (`batcher.TestAddTriggersFlushAtMaxSize`); it has
+never actually fired in a real end-to-end run against real Kafka/ClickHouse
+containers. Deferred to Phase 6, which is where sustained high-rate load
+generation (and finding out what actually happens at 2,500+ spans/sec) is
+in scope.
 
 ## Phase 2 — TBD
 
