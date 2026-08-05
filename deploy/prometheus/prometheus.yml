@@ -9,3 +9,7 @@ scrape_configs:
   - job_name: writer
     static_configs:
       - targets: ["writer:8080"]
+
+  - job_name: analyzer
+    static_configs:
+      - targets: ["analyzer:9464"]

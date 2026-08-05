@@ -14,6 +14,8 @@ package integration
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,6 +28,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 )
 
 const (
@@ -94,7 +104,13 @@ func TestClickHouseOutageBackpressureAndRecovery(t *testing.T) {
 		t.Fatalf("stop clickhouse: %v", err)
 	}
 
-	sentDuringOutage := runLoadgen(t, 20, 5*time.Second)
+	// loadgen itself now requires ClickHouse (to record ground truth) and
+	// fails fast at startup if it's unreachable — so it can't be the one
+	// generating traffic during a ClickHouse outage. sendRawSpans talks to
+	// the collector directly, bypassing loadgen (and ground truth)
+	// entirely, since this test only cares about the writer's behavior
+	// under a ClickHouse outage, not about ground truth accuracy.
+	sentDuringOutage := sendRawSpans(t, "localhost:4317", 100)
 	t.Logf("sent %d more spans while ClickHouse was down", sentDuringOutage)
 
 	// Give the writer a few flush/retry cycles to notice the outage.
@@ -175,7 +191,7 @@ func chQuery(query string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -206,6 +222,8 @@ func runLoadgen(t *testing.T, rate float64, duration time.Duration) int {
 		"--target", "collector:4317",
 		"--rate", fmt.Sprintf("%f", rate),
 		"--duration", duration.String(),
+		"--clickhouse-addr", "clickhouse:9000",
+		"--clickhouse-password", clickhousePassword,
 	)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -219,6 +237,64 @@ func runLoadgen(t *testing.T, rate float64, duration time.Duration) int {
 		t.Fatalf("could not find sent_spans in loadgen output:\n%s", stdout.String())
 	}
 	return sent
+}
+
+// sendRawSpans sends count trivial, unrelated single-span traces directly
+// to the collector at target, bypassing loadgen entirely. Used where a
+// test needs to generate collector traffic without loadgen's ClickHouse
+// dependency (e.g. while ClickHouse is intentionally down) and doesn't
+// care about realistic trace shape or ground truth — just that spans
+// were durably accepted and can be counted in ClickHouse later.
+func sendRawSpans(t *testing.T, target string, count int) int {
+	t.Helper()
+
+	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial collector at %s: %v", target, err)
+	}
+	defer func() { _ = conn.Close() }()
+	client := coltracepb.NewTraceServiceClient(conn)
+
+	sent := 0
+	for i := 0; i < count; i++ {
+		now := time.Now()
+		span := &tracepb.Span{
+			TraceId:           randomID(16),
+			SpanId:            randomID(8),
+			Name:              "synthetic",
+			Kind:              tracepb.Span_SPAN_KIND_SERVER,
+			StartTimeUnixNano: uint64(now.UnixNano()),
+			EndTimeUnixNano:   uint64(now.Add(time.Millisecond).UnixNano()),
+			Status:            &tracepb.Status{Code: tracepb.Status_STATUS_CODE_OK},
+		}
+		req := &coltracepb.ExportTraceServiceRequest{
+			ResourceSpans: []*tracepb.ResourceSpans{
+				{
+					Resource: &resourcepb.Resource{
+						Attributes: []*commonpb.KeyValue{
+							{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "outage-test"}}},
+						},
+					},
+					ScopeSpans: []*tracepb.ScopeSpans{{Spans: []*tracepb.Span{span}}},
+				},
+			},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err := client.Export(ctx, req)
+		cancel()
+		if err != nil {
+			t.Fatalf("export span %d/%d: %v", i+1, count, err)
+		}
+		sent++
+	}
+	return sent
+}
+
+func randomID(n int) []byte {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return b
 }
 
 // parseSentSpans scans loadgen's JSON log lines for the final summary.
@@ -250,7 +326,7 @@ func writerConsumerLagTotal(t *testing.T) int64 {
 	if err != nil {
 		t.Fatalf("fetch writer metrics: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var total float64
 	scanner := bufio.NewScanner(resp.Body)

@@ -1,40 +1,40 @@
-// Package fault defines the pluggable fault-injection interface for
-// loadgen. Phase 0 ships only NoopInjector; clock skew, out-of-order
-// delivery, and span drops are added as additional Injectors in Phase 6
-// without changing the emit path.
+// Package fault defines pluggable fault injectors for loadgen. Each
+// injector operates on a trace's []spanplan.PlannedSpan — the pristine
+// output of topology generation — and returns a plan mutated to reflect
+// one failure mode: dropped spans, delayed emission (out-of-order,
+// late-arrival), or altered content. Ground truth is always recorded from
+// the pristine, pre-fault plan; injectors run after that, on a copy.
 package fault
 
-import tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+import "github.com/kishoresj/distributed-tracing-platform/loadgen/internal/spanplan"
 
-// Injector mutates or drops spans within a trace before it is sent, to
-// simulate real-world transport and clock imperfections.
+// Injector transforms a trace's emission plan to simulate one failure
+// mode. Implementations must not mutate the input slice's backing array in
+// place if they change span content — return a new slice/span instead —
+// but may freely set Delay/Drop on copies of the plan elements.
 type Injector interface {
 	// Name identifies the injector for logging.
 	Name() string
-	// Apply transforms spans and returns the set that should actually be
-	// sent. An injector simulating drops returns a subset; one simulating
-	// clock skew returns the same spans with timestamps mutated.
-	Apply(spans []*tracepb.Span) []*tracepb.Span
+	Apply(plan []spanplan.PlannedSpan) []spanplan.PlannedSpan
 }
 
-// NoopInjector applies no faults. It is the default and only Injector
-// enabled in Phase 0.
+// NoopInjector applies no faults.
 type NoopInjector struct{}
 
 // Name implements Injector.
 func (NoopInjector) Name() string { return "noop" }
 
 // Apply implements Injector.
-func (NoopInjector) Apply(spans []*tracepb.Span) []*tracepb.Span { return spans }
+func (NoopInjector) Apply(plan []spanplan.PlannedSpan) []spanplan.PlannedSpan { return plan }
 
 // Chain applies a sequence of Injectors in order, feeding each one's output
 // to the next.
 type Chain []Injector
 
 // Apply runs every Injector in the chain in sequence.
-func (c Chain) Apply(spans []*tracepb.Span) []*tracepb.Span {
+func (c Chain) Apply(plan []spanplan.PlannedSpan) []spanplan.PlannedSpan {
 	for _, inj := range c {
-		spans = inj.Apply(spans)
+		plan = inj.Apply(plan)
 	}
-	return spans
+	return plan
 }

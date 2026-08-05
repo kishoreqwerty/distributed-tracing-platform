@@ -1,0 +1,35 @@
+# Default synthetic topology: 6 services, one fan-out (checkout calling
+# three downstream services), and one 4-level chain
+# (frontend -> checkout -> shipping -> notifications).
+root: frontend
+
+services:
+  - name: frontend
+    latency_ms: {mean: 15, stddev: 5}
+  - name: checkout
+    latency_ms: {mean: 25, stddev: 8}
+  - name: inventory
+    latency_ms: {mean: 12, stddev: 4}
+  - name: payments
+    latency_ms: {mean: 40, stddev: 15}
+  - name: shipping
+    latency_ms: {mean: 20, stddev: 6}
+  - name: notifications
+    latency_ms: {mean: 8, stddev: 3}
+
+edges:
+  - caller: frontend
+    callee: checkout
+    call_probability: 1.0
+  - caller: checkout
+    callee: inventory
+    call_probability: 1.0
+  - caller: checkout
+    callee: payments
+    call_probability: 0.9
+  - caller: checkout
+    callee: shipping
+    call_probability: 0.85
+  - caller: shipping
+    callee: notifications
+    call_probability: 0.95

@@ -126,3 +126,65 @@ existing `waitForFinalCount`) instead of sampling it once. Not a pipeline
 bug — the lag number itself was accurate for when it was last computed —
 but worth recording because it's a trap any test (or dashboard alert) using
 this metric can fall into: it lags its own name.
+
+## Phase 2 (partial: loadgen ground truth/fault injection + trace reassembly)
+
+### `clickhouse-connect` returns `FixedString` columns as NUL-padded raw bytes, not decoded strings
+
+**Symptom:** none shipped — caught by testing `reader.py`'s query pattern
+directly against a real ClickHouse before writing the analyzer's actual
+read path, specifically because the writer's Go client
+(`clickhouse-go/v2`) had never needed this kind of decoding and I didn't
+want to assume the Python client behaved the same way. Good thing I
+checked: a root span's `parent_span_id` (inserted as `''`) came back as
+`b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'` —
+16 NUL bytes — not `b''` or `''`.
+
+**Root cause:** ClickHouse's `FixedString(N)` is a fixed-width type; a
+shorter value is right-padded with NUL bytes on disk, and
+`clickhouse-connect` returns the raw padded bytes rather than stripping
+them or decoding to `str`. Had I written `reassembly.py`'s root/orphan
+detection against the naive assumption (`parent_span_id == ""` for a
+root), every root span would have compared unequal to `""` and
+misclassified as an orphan with a garbage 32-byte-of-NULs "parent" that
+never resolves — every trace in every window would have looked rootless.
+
+**Fix:** `chclient.decode_fixed_string` strips trailing NUL bytes and
+decodes to ASCII before `reader.py` ever hands a row to `reassembly.py`.
+Safe specifically because every `FixedString` column in this schema holds
+hex-encoded IDs (or is empty), and hex digits never include a NUL byte, so
+stripping trailing NULs always recovers the exact original value with no
+ambiguity.
+
+### loadgen's new ClickHouse requirement broke the Phase 1 ClickHouse-outage integration test
+
+**Symptom:** `TestClickHouseOutageBackpressureAndRecovery` (written in
+Phase 1, previously passing) failed after this phase's loadgen changes
+landed:
+```
+loadgen failed: exit status 1
+stdout: {"level":"ERROR","msg":"loadgen exited with error",
+"error":"clickhouse ping: dial tcp: lookup clickhouse on 127.0.0.11:53: no such host"}
+```
+
+**Root cause:** that test's whole point is generating collector traffic
+*while ClickHouse is deliberately stopped*, to prove the writer stalls
+instead of losing data. It used to do that by shelling out to loadgen.
+This phase made loadgen fail fast at startup if ClickHouse is
+unreachable — the right call for loadgen itself (see `docs/DECISIONS.md`),
+but it means loadgen can no longer be the thing generating traffic during
+exactly the scenario this test needs traffic generated during. The two
+requirements — "loadgen must have ground truth's ClickHouse dependency"
+and "this test needs traffic with no ClickHouse dependency" — are
+genuinely in tension, not something to route around quietly.
+
+**Fix:** added `sendRawSpans` to the integration test itself — a minimal
+direct OTLP gRPC client (not a loadgen wrapper, not a reuse of loadgen's
+internal packages, which Go's internal-package visibility rules wouldn't
+allow across module boundaries anyway) that talks straight to the
+collector. The pre-outage baseline traffic still goes through real
+loadgen (ClickHouse is up at that point, so ground truth recording is
+exercised as before); only the during-outage traffic bypasses loadgen.
+This keeps the two concerns — "does loadgen's ground truth requirement
+work" and "does the writer survive a ClickHouse outage" — decoupled
+rather than compromising either one to make the other easier to test.
