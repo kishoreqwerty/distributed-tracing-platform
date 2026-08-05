@@ -101,7 +101,7 @@ export function TopologyView({
     }, [] as number[]),
   );
   const width = PADDING * 2 + (maxDepth + 1) * COLUMN_WIDTH;
-  const height = PADDING * 2 + maxRowInAnyColumn * ROW_HEIGHT;
+  const height = Math.max(PADDING * 2 + maxRowInAnyColumn * ROW_HEIGHT, PADDING * 2 + NODE_HEIGHT);
 
   const pos = (service: string) => {
     const p = positions.get(service) ?? { x: 0, y: 0 };
@@ -112,7 +112,8 @@ export function TopologyView({
     <div className="topology-view">
       <svg
         className="topology-view__graph"
-        viewBox={`0 0 ${width} ${Math.max(height, PADDING * 2 + NODE_HEIGHT)}`}
+        viewBox={`0 0 ${width} ${height}`}
+        style={{ aspectRatio: `${width} / ${height}` }}
         role="img"
         aria-label="Service topology graph"
       >

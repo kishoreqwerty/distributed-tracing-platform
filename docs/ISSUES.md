@@ -711,3 +711,171 @@ its `title`. The hover panel's badge stays as-is for the other
 classifications (`cycle_rejected`, unclassified); orphan is now visible
 both ways, persistent and on hover, since the persistent one is the one
 that actually matters for the "distinct at a glance" requirement.
+
+### First live demo dataset's aggressive clock skew fragmented incident grouping — a data-generation artifact, not a suppression bug
+
+**Symptom:** visually reviewing the incidents view against a live demo
+dataset, the same targets (`notifications`, `shipping->notifications`,
+`shipping`) appeared as ~20 separate single- or double-window rows,
+timestamps ~20-100s apart, instead of one incident spanning the full
+60s injected `latency_spike`. This looked exactly like the raw
+per-window detection spam suppression exists to eliminate.
+
+**Investigation:** `suppression.group_detections`' "exact back-to-back"
+rule (module docstring, this file's Phase 3 deliverables-4-5 section)
+is a deliberate, already-documented simplification — a genuine gap
+between two windows legitimately splits an incident. So the real
+question was whether the *underlying* per-window detections actually
+had gaps, or whether something upstream of `group_detections` was
+broken. Querying `tracing.detections` directly for this run's time
+range showed real gaps in the raw data — e.g. `notifications
+percentile_deviation` fired at `20:26:00`, `20:26:20`, then nothing
+until `20:27:20` — and `tracing.service_stats` showed the same target
+missing *entirely* from two whole windows (`20:26:40-20:27:00`,
+`20:28:00-20:28:20`), not just failing to cross a detection threshold.
+The analyzer's own window-processed logs for this run confirmed why:
+`late spans detected` warnings of 132, 937, 723, 709, and 273 spans
+across five separate windows (roughly 14% of the run's ~19,770
+generated spans, total), two windows with `span_count: 0` even though
+traffic was continuously running, and `clock_violation_count` in the
+700-1,500 range per window (a large fraction of resolved parent/child
+pairs failing causality checks).
+
+**Root cause:** the demo dataset used
+`--clock-skew-rate 1.0 --clock-skew-max-offset 5s` — skewing every
+non-root service by up to 5 seconds, simultaneously, against a
+20-second analyzer window (this stack was running with the eval
+overlay's shortened window/watermark). A window's membership query
+filters on a span's own recorded `start_time` (`reader.py`), which
+clock skew directly mutates by design — see `clockskew.py`'s module
+docstring on `resolved_parent_child_pairs` only matching within a
+single window's fetched rows. At a skew magnitude that's a meaningful
+fraction of the window width itself (5s against 20s — up to a quarter
+of the window), applied to every service at once rather than one, span
+timestamps get scattered widely enough to push a real fraction of a
+window's traffic either into the wrong window or past that window's
+watermark by the time it's actually ingested, registering as late and
+permanently excluded from that window's aggregation (`reader.py`'s
+late-span accounting; see `docs/ARCHITECTURE.md`'s trace reassembly
+section — late spans are counted, never retroactively reopen a
+finalized window). That's what produced literal `span_count: 0`
+windows and the gaps `group_detections` correctly, by design, treated
+as separate incidents.
+
+**This is not a bug in `group_detections`, `suppress_propagated`, the
+query API, or the frontend** — all four were re-checked and correctly
+implement "collapse an exact back-to-back run" against whatever the
+`detections` table actually contains; a `checkout->inventory call_rate`
+incident in this same run *did* correctly collapse three consecutive
+windows into one row, proving the mechanism works when its input
+doesn't have real gaps. The bug, such as it is, is in the demo
+dataset's own parameter choice: pairing a multi-second clock-skew
+magnitude with a short analyzer window (a documented tradeoff of using
+the eval overlay for a fast demo turnaround — see
+`docs/DECISIONS.md`) silently breaks a *different* feature (incident
+grouping) than the one clock skew was meant to exercise. **Fix:**
+regenerated the demo dataset with `--clock-skew-max-offset` reduced to
+500ms — still 10-40x the ~13-51ms noise floor `docs/BENCHMARKS.md`
+documents, so offsets remain clearly, reliably detectable — while
+staying a small enough fraction of the 20s window to leave reassembly
+and windowing intact. No code changed for this one; the lesson,
+matching this project's existing "test-methodology, not detector bug"
+precedent above, is that a demo/eval configuration's fault and
+incident parameters aren't independent of each other or of the window
+size in use, and need to be chosen together, not composed by default.
+
+### Topology legend text rendered underneath the graph, not below it
+
+**Symptom:** the two-line legend paragraph beneath the service topology
+SVG visually collided with graph nodes and edges (specifically the
+`payments` node and several edges) rather than appearing below the
+graph as its position in the DOM (a sibling `<p>` after the `<svg>`)
+implied it should.
+
+**Root cause:** `.topology-view__graph`'s CSS set `width: 100%` and
+`overflow: visible` but no explicit height or aspect-ratio, and the
+`<svg>`'s `viewBox` dimensions are computed dynamically from the
+current graph's node/row count. Without a height or aspect-ratio tying
+the element's own layout box to its `viewBox`, the browser falls back
+to the default replaced-element height (150px) for the box used in
+document flow — but `overflow: visible` still lets the *actual*
+rendered content (frequently several hundred px tall for this
+project's topology) draw past that 150px box. The legend paragraph,
+positioned immediately after a box the layout engine believes is only
+150px tall, ends up visually underneath content that box never
+accounted for.
+
+**Fix:** `TopologyView.tsx` now sets `style={{ aspectRatio: `${width}
+/ ${height}` }}` on the `<svg>`, using the same `width`/`height`
+values already computed for the `viewBox`, so the element's actual
+layout box always matches what it draws — no more relying on the
+browser's height-less-replaced-element default. `overflow: visible`
+was removed from the CSS since it's no longer covering for a
+size mismatch that shouldn't exist in the first place.
+
+### The root service's clock offset displays identically to "insufficient data," but it's a different thing entirely
+
+**Symptom:** the topology view showed `frontend` (this topology's root
+service) as `offset: unknown (n=0)` — the exact same rendering the UI
+uses for a service whose offset estimate has too few observations to
+trust — while every other service showed a real offset with
+confidence in the hundreds.
+
+**Confirmed mechanism, not a bug in the estimation itself:**
+`clockskew.estimate_offsets` (`analyzer/src/analyzer/clockskew.py:121`)
+initializes `offsets = {root_service: ServiceOffset(root_service, 0,
+confidence=0)}` before doing anything else — the root's offset is
+*defined* to be exactly zero (see the module's own docstring: "Offsets
+are therefore estimated relative to a chosen root service, whose own
+offset is defined as exactly zero"), not computed from observations at
+all. The root is never a *child* in any resolved parent/child pair (it
+has no parent span by construction), and this estimator only ever
+derives a service's offset from edges where that service is the
+callee — so a root service structurally can never accumulate the kind
+of observation this `confidence` field counts. `confidence=0` here
+isn't "zero observations gathered so far," the way it would be for a
+non-root service that just hasn't been called yet — it's a
+placeholder for "not applicable, this is the anchor."
+
+**Real, unfixed limitation — not fabricating a number for it.** The
+frontend's `CLOCK_OFFSET_CONFIDENCE_THRESHOLD` gate
+(`src/lib/clockOffset.ts`) can't currently distinguish "the anchor,
+zero by definition" from "a real service with a genuinely unreliable
+estimate," because the API sends the same two fields
+(`offset_ns: 0, confidence: 0`) for both cases and nothing marks a
+service as the topology's root. Displaying `0ms` outright for the root
+would be defensible (it *is* exactly zero, by the method's own
+construction) but was deliberately not done here — synthesizing a
+different rendering path for "this specific service" based on
+frontend-side topology-root inference (rather than an explicit API
+field) risks being wrong for a topology this project doesn't already
+know is always a tree with one root, and doing it right means a real
+API change, not a frontend guess. Left as `unknown (n=0)`, which is at
+least not a fabricated confident-looking number — just not a maximally
+clear one either. See `docs/BENCHMARKS.md` for how this affects that
+section's clock-offset-error reporting.
+
+### Single-window incidents displayed a 0s duration
+
+**Symptom:** an incident whose `window_count` was 1 rendered `0s` in
+the incidents table's Duration column — misleading, since even a
+one-window incident lasted at least one full window.
+
+**Root cause:** `start_window` and `end_window` are both window *start*
+timestamps (the first and last window included in a group — see
+`suppression._build_incident`), not the incident's true start and end;
+`durationLabel` naively subtracted them. For a single-window incident
+these are the same timestamp by construction, so the subtraction is
+always exactly zero, not merely small.
+
+**Fix:** `durationLabel` (`IncidentsView.tsx`) now takes `window_count`
+and returns the plain label `"single window"` when it's `1`, instead of
+computing a numeric duration. Deliberately not "fixed" by adding the
+analyzer's `window_seconds` to `end_window` client-side — that value
+isn't exposed anywhere in the API response, and guessing at it (or
+adding a new API field for a display-only concern) both reached further
+than this bug needed. `start_window`/`end_window` remaining
+window-*start* markers for both bounds is also load-bearing elsewhere
+(`suppress_propagated`'s `overlaps()` check compares them the same way
+on both sides), so their meaning wasn't a good candidate for changing
+just to fix a label.

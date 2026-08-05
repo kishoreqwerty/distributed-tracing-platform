@@ -6,7 +6,16 @@ import { useApiQuery } from "../hooks/useApiQuery";
 
 const POLL_MS = 10_000;
 
-function durationLabel(startIso: string, endIso: string): string {
+function durationLabel(startIso: string, endIso: string, windowCount: number): string {
+  // start_window/end_window are both window *start* timestamps (the
+  // first and last window included in the group), not the incident's
+  // true start/end — a single-window incident therefore has
+  // start === end and a naive subtraction reads as 0s, understating an
+  // incident that in reality lasted at least one full window. The API
+  // doesn't expose window_seconds, so rather than guess at it here,
+  // a single-window incident gets a plain, non-numeric label instead of
+  // a fabricated duration.
+  if (windowCount <= 1) return "single window";
   const seconds = (new Date(endIso).getTime() - new Date(startIso).getTime()) / 1000;
   if (seconds < 60) return `${seconds.toFixed(0)}s`;
   return `${(seconds / 60).toFixed(1)}m`;
@@ -19,20 +28,25 @@ function ExampleTraces({
   incident: Incident;
   onSelectTrace: (traceId: string) => void;
 }) {
-  const service = incident.target_type === "service" ? incident.target : incident.target.split("->")[0];
+  // /api/traces' service filter matches root_service, not "any span in
+  // this trace touched this service" (see routes.py's own param
+  // description) — every trace in this topology is rooted at the same
+  // service (frontend), so filtering by the incident's own target here
+  // would silently return zero traces for almost every incident, not
+  // because none exist but because the filter can never match. Scoping
+  // by the incident's time window alone is what the API can actually
+  // answer cheaply; a real "touched this service" filter would need a
+  // join against tracing.spans this view doesn't need badly enough to
+  // ask for.
   const query = useApiQuery(
-    () =>
-      fetchTraces(
-        { start: incident.start_window, end: incident.end_window },
-        { service, limit: 5 },
-      ),
+    () => fetchTraces({ start: incident.start_window, end: incident.end_window }, { limit: 5 }),
     [incident.incident_id],
   );
 
   if (query.state.status === "loading") return <p className="text-faint">Loading example traces…</p>;
   if (query.state.status === "error") return <ErrorState error={query.state.error} onRetry={query.refetch} />;
   if (query.state.data.traces.length === 0) {
-    return <p className="text-faint">No traces landed for {service} in this incident's window.</p>;
+    return <p className="text-faint">No traces landed in this incident's window.</p>;
   }
   return (
     <ul className="incidents-view__example-traces">
@@ -137,7 +151,7 @@ export function IncidentsView({
                     )}
                   </td>
                   <td>{new Date(inc.start_window).toLocaleTimeString()}</td>
-                  <td>{durationLabel(inc.start_window, inc.end_window)}</td>
+                  <td>{durationLabel(inc.start_window, inc.end_window, inc.window_count)}</td>
                   <td>{inc.detector}</td>
                 </tr>
                 {expandedId === inc.incident_id && (

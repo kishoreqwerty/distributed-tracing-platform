@@ -261,9 +261,9 @@ button.link-button:hover {
 /* ---- topology view ---- */
 
 .topology-view__graph {
+  display: block;
   width: 100%;
   max-width: 100%;
-  overflow: visible;
 }
 
 .topology-node {

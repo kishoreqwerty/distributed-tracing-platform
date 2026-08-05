@@ -191,6 +191,18 @@ expected going in.** Per-service estimated-vs-true offsets, from
 | 10% | true 0, err 0 | true 0, err 0 | true 0, err **51.58ms** | true 0, err **12.90ms** | true 0, err **51.58ms** |
 | 25% | true **-1712.68ms**, err **0** | true 0, err 0 | true 0, err **51.42ms** | true 0, err **12.76ms** | true 0, err **51.42ms** |
 
+`frontend`, the topology's root service, never appears in this table by
+design: its offset is defined as exactly zero by `estimate_offsets`
+itself (see `clockskew.py`'s module docstring and
+`docs/ISSUES.md`), not measured from any observation, so there's no
+"error" to report — reporting `0` here would be reporting the method's
+own anchoring assumption back as if it were a finding. The dashboard
+shows the root as `offset: unknown (n=0)` rather than a bare `0ms`,
+for the same reason: `confidence=0` in this one case means "not
+applicable" rather than "no data yet," and the two currently render
+identically — a real, documented UI limitation, not a fabricated
+number (see `docs/ISSUES.md`).
+
 At 1/5/10% no service actually got skewed by the fault injector
 (`--clock-skew-rate` decides per-service, independently, once per run —
 at low rates the random draw came up clean for every service in all

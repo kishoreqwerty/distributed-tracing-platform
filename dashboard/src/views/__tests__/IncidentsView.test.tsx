@@ -109,4 +109,61 @@ describe("IncidentsView", () => {
 
     await waitFor(() => expect(screen.getByText(/root not in range/)).toBeInTheDocument());
   });
+
+  it("labels a single-window incident's duration honestly instead of computing a fabricated 0s", async () => {
+    fetchDetections.mockResolvedValueOnce(
+      detections({
+        incidents: [
+          {
+            incident_id: "brief-1",
+            target_type: "service",
+            target: "payments",
+            detector: "call_rate",
+            severity: "warning",
+            start_window: "2026-01-01T00:10:00Z",
+            end_window: "2026-01-01T00:10:00Z",
+            window_count: 1,
+            peak_deviation: 4.0,
+            derived: false,
+            root_cause_incident_id: null,
+            root_cause_target: null,
+          },
+        ],
+      }),
+    );
+
+    render(<IncidentsView range={RANGE} targetFilter={undefined} onSelectService={vi.fn()} onSelectTrace={vi.fn()} />);
+
+    await waitFor(() => expect(screen.getByText("payments")).toBeInTheDocument());
+    expect(screen.getByText("single window")).toBeInTheDocument();
+    expect(screen.queryByText("0s")).not.toBeInTheDocument();
+  });
+
+  it("shows a real duration for a multi-window incident rather than the single-window label", async () => {
+    fetchDetections.mockResolvedValueOnce(
+      detections({
+        incidents: [
+          {
+            incident_id: "root-1",
+            target_type: "service",
+            target: "inventory",
+            detector: "percentile_deviation",
+            severity: "critical",
+            start_window: "2026-01-01T00:10:00Z",
+            end_window: "2026-01-01T00:11:00Z",
+            window_count: 3,
+            peak_deviation: 12.0,
+            derived: false,
+            root_cause_incident_id: null,
+            root_cause_target: null,
+          },
+        ],
+      }),
+    );
+
+    render(<IncidentsView range={RANGE} targetFilter={undefined} onSelectService={vi.fn()} onSelectTrace={vi.fn()} />);
+
+    await waitFor(() => expect(screen.getByText("inventory")).toBeInTheDocument());
+    expect(screen.getByText("1.0m")).toBeInTheDocument();
+  });
 });
