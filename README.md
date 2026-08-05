@@ -185,15 +185,19 @@ finding, not a hypothetical:
 
 - **Healthy-control false-positive rate is not good.** Over one 180s
   run with zero injected incidents: **949.6 detections/hour** measured
-  over the full evaluated range (including the harness's own inter-run
-  silence), or **282.9/hour** measured strictly within the run's own
-  active window. Every single one of these is a `call_rate` detection
-  triggered by a finite load generator process ramping traffic up and
-  down at its own start/end — not a detector malfunction, but a real
-  artifact of how this project's test harness generates traffic that
-  would need a different harness shape (or explicit boundary-window
-  exclusion) to measure past. See `docs/BENCHMARKS.md`'s
-  "Healthy-control false positives" section for the full mechanism.
+  over the full evaluated range including the harness's own margin
+  around the run (`[lo-30s, hi+30s]`, which also picks up the
+  inter-sweep-point silence next to it), versus **282.9/hour** measured
+  strictly within the run's own active window (`[lo, hi]`, no margin).
+  Which one is "the" rate is deliberately left unresolved rather than
+  picked: both are real measurements of the same underlying artifact
+  (a finite load generator's own traffic ramping up and down at its
+  start/end) at two different, both-legitimate scopes, and this project
+  doesn't have a continuously-running-with-no-process-boundary system to
+  measure a single ground-truth number against — narrowing to one
+  figure would just be hiding which scope produced it. See
+  `docs/BENCHMARKS.md`'s "Healthy-control false positives" section for
+  the full mechanism.
 - **Clock offset estimation has a ~13-51ms structural noise floor.**
   At clock-skew rates where no service actually got skewed, the
   estimator still consistently reports 12.76-13.02ms of "drift" for
