@@ -1,6 +1,6 @@
 # Architecture
 
-## Components (Phase 3)
+## Components (Phase 4, partial: query API only — dashboard not yet built)
 
 ```mermaid
 flowchart LR
@@ -10,6 +10,7 @@ flowchart LR
     writer["writer (Go)\nKafka consumer -> ClickHouse batch writer"]
     clickhouse[("ClickHouse")]
     analyzer["analyzer (Python)\nreassembly + topology graph\n+ clock skew + baselines\n+ detection + suppression + eval"]
+    api["analyzer-api (Python)\nread-only FastAPI query layer\nsame package as analyzer,\nseparate process"]
     prometheus["Prometheus"]
     grafana["Grafana"]
     dashboard["dashboard (React/TS)\n[empty scaffold]"]
@@ -23,25 +24,65 @@ flowchart LR
     analyzer -- "write: trace_summaries,\nspan_classifications,\nservice_edges, service_stats,\nservice_clock_offsets" --> clickhouse
     analyzer -- "write: service_baselines,\nedge_baselines, detections,\ndetected_incidents" --> clickhouse
     analyzer -- "eval.py: compare\nreconstruction + detections vs\nground truth" --> clickhouse
+    api -- "read-only: GET /api/*" --> clickhouse
     prometheus -- "scrape /metrics" --> collector
     prometheus -- "scrape /metrics" --> writer
     prometheus -- "scrape /metrics" --> analyzer
     grafana -- "query" --> prometheus
-    dashboard -. "later phase" .-> analyzer
-    dashboard -. "later phase: direct query" .-> clickhouse
+    dashboard -. "later phase" .-> api
 ```
 
 Dotted edges are not implemented yet — only `dashboard` remains one, as an
-empty scaffold. `analyzer` now does everything this project's core
-measurement loop needs: trace reassembly, service topology aggregation,
-clock skew detection, rolling baselines, anomaly detection, alert
-suppression, and (`eval.py`) comparing its own reconstruction and
-detections against loadgen's ground truth. `loadgen` writes ground truth
-straight to ClickHouse, independent of (and prior to) whatever the
-OTLP/fault-injected path actually delivers, and now also schedules
-*incidents* — real behavior changes in the simulated system, a
-deliberately separate concept from fault injection — see "Ground truth"
-and "Incident injection" below.
+empty scaffold; `api` (deliverable 1 of Phase 4) is built and live, just
+not yet consumed by anything. `analyzer` does everything this project's
+core measurement loop needs: trace reassembly, service topology
+aggregation, clock skew detection, rolling baselines, anomaly detection,
+alert suppression, and (`eval.py`) comparing its own reconstruction and
+detections against loadgen's ground truth. `analyzer-api` is a second
+process built from the same Python package and the same Docker image
+(`analyzer/Dockerfile`, different entrypoint) — it shares `analyzer`'s
+ClickHouse client and config code but no runtime state, and never writes
+anything; see "Query API" below. `loadgen` writes ground truth straight
+to ClickHouse, independent of (and prior to) whatever the OTLP/
+fault-injected path actually delivers, and also schedules *incidents* —
+real behavior changes in the simulated system, a deliberately separate
+concept from fault injection — see "Ground truth" and "Incident
+injection" below.
+
+## Query API
+
+`analyzer/src/analyzer/api/` — a read-only FastAPI layer over the
+tables Phases 1-3 already populate. Nothing in this API detects,
+reassembles, or writes anything; it exists because a browser can't query
+ClickHouse directly. See docs/DECISIONS.md for why it's a separate
+process sharing the `analyzer` package rather than a standalone service
+or a thread inside the main analyzer loop.
+
+- `routes.py` holds the one piece of genuinely new logic: every endpoint
+  requires an explicit time range, capped server-side
+  (`API_MAX_TIME_RANGE_SECONDS`), and every list endpoint's result count
+  is capped server-side (`API_MAX_ROWS`) regardless of what a client
+  requests — enforced before any query runs, not left to the `LIMIT`
+  clause alone. This is what `tests/test_api_routes.py` actually tests,
+  against a faked ClickHouse client.
+- `queries.py` is the direct SQL, one function per endpoint's data need —
+  read against a fake client in tests only incidentally (through the
+  routes above); the SQL's real correctness was verified live against
+  the running stack's actual data, the same way every other impure
+  `_fetch_*`-shaped function in this project has been (reader.py,
+  eval.py).
+- `schemas.py` is the Pydantic wire format, deliberately a separate set
+  of types from `queries.py`'s plain dataclasses — a ClickHouse column
+  rename becomes a visible conversion-site change, not a silent
+  wire-format break.
+- Endpoints: `GET /api/traces` (paginated, filterable by service/
+  completeness/minimum duration), `GET /api/traces/{trace_id}` (every
+  span, each with its reassembly classification), `GET /api/topology`
+  (service edges for a range: summed call/error counts, most-recent-window
+  latency percentiles), `GET /api/detections` (grouped incidents for a
+  range, derived/root-cause resolved where the root is in the same
+  page), `GET /api/clock-offsets` (per-service offset + confidence,
+  highest-confidence reading per service in range).
 
 ## Data flow — span lifecycle from emit to query
 
@@ -396,7 +437,8 @@ numbers and `integration/pipeline_test.go`'s
 /writer              Go — Kafka consumer -> ClickHouse batch writer
 /loadgen             Go — topology-driven trace generator, fault + incident injection, ground truth writer
 /analyzer            Python — reassembly, topology graph, clock skew, baselines,
-                       anomaly detection, alert suppression, accuracy eval (eval.py)
+                       anomaly detection, alert suppression, accuracy eval (eval.py),
+                       read-only query API (api/, runs as its own container)
 /integration         Go — compose-based integration tests (build tag: integration)
 /scripts             run_sweep.sh (Phase 2 fault sweep), run_incident_sweep.sh (Phase 3 incident sweep)
 /dashboard           React/TS (empty scaffold)
@@ -412,10 +454,14 @@ docker compose up --build
 ```
 
 Brings up Redpanda (plus a one-shot job that creates the 4-partition
-`spans` topic), ClickHouse, collector, writer, analyzer, Prometheus, and
-Grafana. Grafana is at `http://localhost:3000` (anonymous viewer access
-enabled for local dev) with Prometheus already wired in as a datasource.
-Prometheus targets page is at `http://localhost:9090/targets`.
+`spans` topic), ClickHouse, collector, writer, analyzer, analyzer-api,
+Prometheus, and Grafana. Grafana is at `http://localhost:3000`
+(anonymous viewer access enabled for local dev) with Prometheus already
+wired in as a datasource. Prometheus targets page is at
+`http://localhost:9090/targets`. The query API is at
+`http://localhost:8000` — e.g.
+`curl 'http://localhost:8000/api/topology?start=2026-01-01T00:00:00Z&end=2026-01-01T01:00:00Z'`
+(every endpoint requires `start`/`end`; see "Query API" above).
 
 ```sh
 cd loadgen

@@ -111,6 +111,33 @@ services:
       timeout: 5s
       retries: 10
 
+  # Same image as `analyzer` (same build context, same installed
+  # package) — only the entrypoint differs. Deliberately a separate
+  # container: the query API serves browser requests on its own
+  # schedule, and has no business sharing a process with analyzer's
+  # synchronous reassembly/detection poll loop. See docs/DECISIONS.md.
+  analyzer-api:
+    build: ../analyzer
+    entrypoint: ["uvicorn", "analyzer.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      CLICKHOUSE_HTTP_HOST: "clickhouse"
+      CLICKHOUSE_HTTP_PORT: "8123"
+      CLICKHOUSE_DB: "tracing"
+      CLICKHOUSE_USER: "default"
+      CLICKHOUSE_PASSWORD: "tracing-dev"
+      API_MAX_ROWS: "500"
+      API_MAX_TIME_RANGE_SECONDS: "86400"
+    ports:
+      - "8000:8000"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   prometheus:
     image: prom/prometheus:v2.53.0
     volumes:

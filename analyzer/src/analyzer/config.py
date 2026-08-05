@@ -49,6 +49,17 @@ class Config:
     # its lookback boundary catches up to it.
     grouping_lookback_seconds: int
 
+    # Query API (api/) — a separate process/container from the main
+    # analyzer loop, sharing this same Config. See docs/DECISIONS.md for
+    # why it lives in this module rather than a standalone service.
+    api_http_host: str
+    api_http_port: int
+    # Server-side ceilings applied to every list endpoint, regardless of
+    # what a client requests — "no unbounded queries" isn't a client-side
+    # convention here, it's enforced on the server.
+    api_max_rows: int
+    api_max_time_range_seconds: int
+
 
 def load() -> Config:
     return Config(
@@ -71,6 +82,10 @@ def load() -> Config:
         error_rate_min_sample_size=_env_int("ANALYZER_ERROR_RATE_MIN_SAMPLE_SIZE", 10),
         call_rate_threshold=_env_float("ANALYZER_CALL_RATE_THRESHOLD", 3.0),
         grouping_lookback_seconds=_env_int("ANALYZER_GROUPING_LOOKBACK_SECONDS", 300),
+        api_http_host=_env_str("API_HTTP_HOST", "0.0.0.0"),
+        api_http_port=_env_int("API_HTTP_PORT", 8000),
+        api_max_rows=_env_int("API_MAX_ROWS", 500),
+        api_max_time_range_seconds=_env_int("API_MAX_TIME_RANGE_SECONDS", 86400),
     )
 
 
