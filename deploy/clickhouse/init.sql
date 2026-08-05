@@ -48,11 +48,21 @@ CREATE TABLE IF NOT EXISTS tracing.spans
     status_code          Int8,                                        -- OTLP Status.StatusCode: 0=UNSET 1=OK 2=ERROR
     attributes           Map(String, String),
 
-    start_time           DateTime64(9) MATERIALIZED fromUnixTimestamp64Nano(start_time_unix_nano),
+    -- ReplacingMergeTree version column. Phase 1 delivery is at-least-once
+    -- (see docs/DECISIONS.md): the writer may insert the same (trace_id,
+    -- span_id) more than once after a retry or a rebalance. Content for a
+    -- given span_id never changes between redeliveries, so which duplicate
+    -- "wins" the merge doesn't matter — this column exists only to give
+    -- ReplacingMergeTree a well-ordered tiebreaker, defaulting to insert
+    -- time. It is a plain DEFAULT (not MATERIALIZED) so a future writer
+    -- could set it explicitly if that ever becomes useful.
+    ingested_at           DateTime64(9) DEFAULT now64(9),
+
+    start_time            DateTime64(9) MATERIALIZED fromUnixTimestamp64Nano(start_time_unix_nano),
 
     INDEX idx_service_name service_name TYPE set(100) GRANULARITY 4
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toDate(start_time)
 ORDER BY (trace_id, span_id)
 TTL toDateTime(start_time) + INTERVAL 30 DAY;

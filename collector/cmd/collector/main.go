@@ -1,6 +1,6 @@
 // Command collector runs the OTLP gRPC trace receiver plus a health/metrics
-// HTTP server. It receives spans, counts and logs them, and discards them —
-// forwarding to Kafka is added in Phase 1.
+// HTTP server. It validates received spans and publishes them to Kafka,
+// keyed by trace_id.
 package main
 
 import (
@@ -13,6 +13,8 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -22,6 +24,8 @@ import (
 
 	"github.com/kishoresj/distributed-tracing-platform/collector/internal/config"
 	"github.com/kishoresj/distributed-tracing-platform/collector/internal/httpserver"
+	"github.com/kishoresj/distributed-tracing-platform/collector/internal/kafkaproducer"
+	"github.com/kishoresj/distributed-tracing-platform/collector/internal/metrics"
 	"github.com/kishoresj/distributed-tracing-platform/collector/internal/otlpreceiver"
 )
 
@@ -43,20 +47,35 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(collectors.NewGoCollector())
+	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	m := metrics.New(reg)
+
+	producer, err := kafkaproducer.New(kafkaproducer.Options{
+		Brokers:         cfg.KafkaBrokers,
+		Topic:           cfg.KafkaTopic,
+		MaxInFlight:     cfg.KafkaMaxInFlight,
+		DeliveryTimeout: cfg.KafkaDeliveryTimeout,
+	}, logger, m)
+	if err != nil {
+		return err
+	}
+
 	lis, err := net.Listen("tcp", cfg.GRPCAddr)
 	if err != nil {
 		return err
 	}
 
 	grpcServer := grpc.NewServer()
-	coltracepb.RegisterTraceServiceServer(grpcServer, otlpreceiver.New(logger))
+	coltracepb.RegisterTraceServiceServer(grpcServer, otlpreceiver.New(logger, producer, m))
 
 	healthServer := health.NewServer()
 	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
 	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
 	reflection.Register(grpcServer)
 
-	httpServer := httpserver.New(cfg.HTTPAddr)
+	httpServer := httpserver.New(cfg.HTTPAddr, reg)
 
 	errCh := make(chan error, 2)
 
@@ -98,6 +117,13 @@ func run(logger *slog.Logger) error {
 
 	<-httpDone
 	<-grpcDone
+
+	// Close the producer only after GracefulStop returns, so any span still
+	// being published when a shutdown signal arrived gets a chance to
+	// finish first — GracefulStop waits for in-flight Export calls, but
+	// PublishSpan itself is async, so this is a best-effort drain, not a
+	// guarantee every in-flight produce completes.
+	producer.Close()
 
 	logger.Info("shutdown complete")
 	return nil

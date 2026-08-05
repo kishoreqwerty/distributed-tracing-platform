@@ -17,6 +17,10 @@ import (
 	"github.com/kishoresj/distributed-tracing-platform/loadgen/internal/tracegen"
 )
 
+// sendTimeout bounds a single Send call, independent of the run's overall
+// duration — see the comment at its use site.
+const sendTimeout = 10 * time.Second
+
 func main() {
 	target := flag.String("target", "localhost:4317", "collector OTLP gRPC address")
 	rate := flag.Float64("rate", 1.0, "traces per second")
@@ -56,25 +60,37 @@ func run(logger *slog.Logger, target string, rate float64, duration time.Duratio
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	sent, failed := 0, 0
+	sent, failed, sentSpans := 0, 0, 0
 	logger.Info("starting load generation", "target", target, "rate_per_sec", rate, "duration", duration.String())
 
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("load generation complete", "sent", sent, "failed", failed)
+			logger.Info("load generation complete", "sent", sent, "failed", failed, "sent_spans", sentSpans)
 			return nil
 		case <-ticker.C:
 			rs := tracegen.Trace()
+			spanCount := 0
 			for _, r := range rs {
 				r.ScopeSpans[0].Spans = injectors.Apply(r.ScopeSpans[0].Spans)
+				spanCount += len(r.ScopeSpans[0].Spans)
 			}
-			if err := em.Send(ctx, rs); err != nil {
+			// A send's own timeout is independent of the run's overall
+			// deadline. Reusing ctx here would let a send started just
+			// before the deadline get client-side canceled by
+			// context.DeadlineExceeded even after the collector fully
+			// processed and published it server-side — undercounting
+			// "sent" relative to what actually landed downstream.
+			sendCtx, cancelSend := context.WithTimeout(context.Background(), sendTimeout)
+			err := em.Send(sendCtx, rs)
+			cancelSend()
+			if err != nil {
 				failed++
 				logger.Warn("send failed", "error", err)
 				continue
 			}
 			sent++
+			sentSpans += spanCount
 		}
 	}
 }

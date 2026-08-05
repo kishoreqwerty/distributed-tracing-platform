@@ -6,6 +6,9 @@ require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.25.0
 	github.com/prometheus/client_golang v1.19.1
 	github.com/twmb/franz-go v1.17.1
+	github.com/twmb/franz-go/pkg/kadm v1.13.0
+	go.opentelemetry.io/proto/otlp v1.3.1
+	google.golang.org/protobuf v1.34.2
 )
 
 require (
@@ -28,7 +31,7 @@ require (
 	github.com/twmb/franz-go/pkg/kmsg v1.8.0 // indirect
 	go.opentelemetry.io/otel v1.26.0 // indirect
 	go.opentelemetry.io/otel/trace v1.26.0 // indirect
-	golang.org/x/sys v0.18.0 // indirect
-	google.golang.org/protobuf v1.33.0 // indirect
+	golang.org/x/crypto v0.23.0 // indirect
+	golang.org/x/sys v0.20.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

@@ -16,6 +16,21 @@ services:
       timeout: 5s
       retries: 20
 
+  # One-shot: creates the "spans" topic with a fixed partition count before
+  # collector/writer start. Partition count is a topic-creation-time
+  # decision in Kafka/Redpanda (changing it later reshuffles keys across
+  # partitions), so it's set explicitly here rather than left to
+  # auto-create-on-first-produce defaults.
+  redpanda-topic-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - "rpk topic create spans --partitions 4 --replicas 1 --brokers redpanda:9092 || rpk topic describe spans --brokers redpanda:9092"
+    restart: "no"
+
   clickhouse:
     image: clickhouse/clickhouse-server:24.3
     environment:
@@ -38,9 +53,14 @@ services:
     environment:
       COLLECTOR_GRPC_ADDR: ":4317"
       COLLECTOR_HTTP_ADDR: ":4318"
+      KAFKA_BROKERS: "redpanda:9092"
+      KAFKA_TOPIC: "spans"
     ports:
       - "4317:4317"
       - "4318:4318"
+    depends_on:
+      redpanda-topic-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-q", "-O-", "http://localhost:4318/healthz"]
       interval: 5s
@@ -52,7 +72,7 @@ services:
     environment:
       WRITER_HTTP_ADDR: ":8080"
       KAFKA_BROKERS: "redpanda:9092"
-      KAFKA_TOPIC: "otlp-spans"
+      KAFKA_TOPIC: "spans"
       CLICKHOUSE_ADDR: "clickhouse:9000"
       CLICKHOUSE_DB: "tracing"
       CLICKHOUSE_USER: "default"
@@ -60,8 +80,8 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      redpanda:
-        condition: service_healthy
+      redpanda-topic-init:
+        condition: service_completed_successfully
       clickhouse:
         condition: service_healthy
     healthcheck:

@@ -1,7 +1,6 @@
-// Command writer proves connectivity to Redpanda and ClickHouse at startup,
-// failing fast and loudly if either is unreachable. It does not consume
-// messages or write rows yet — that arrives in Phase 1. Once connectivity is
-// confirmed it serves health/metrics until it receives a shutdown signal.
+// Command writer consumes spans from Kafka and batch-inserts them into
+// ClickHouse, committing offsets only after a successful insert. It fails
+// fast and loudly if either Kafka or ClickHouse is unreachable at startup.
 package main
 
 import (
@@ -13,10 +12,15 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/kishoresj/distributed-tracing-platform/writer/internal/clickhousecheck"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+
+	"github.com/kishoresj/distributed-tracing-platform/writer/internal/chwriter"
 	"github.com/kishoresj/distributed-tracing-platform/writer/internal/config"
+	"github.com/kishoresj/distributed-tracing-platform/writer/internal/consumer"
 	"github.com/kishoresj/distributed-tracing-platform/writer/internal/httpserver"
-	"github.com/kishoresj/distributed-tracing-platform/writer/internal/kafkacheck"
+	"github.com/kishoresj/distributed-tracing-platform/writer/internal/lagreporter"
+	"github.com/kishoresj/distributed-tracing-platform/writer/internal/metrics"
 )
 
 func main() {
@@ -34,30 +38,49 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	connectCtx, cancel := context.WithTimeout(context.Background(), cfg.ConnectTimeout)
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 
-	if err := kafkacheck.Ping(connectCtx, cfg.KafkaBrokers); err != nil {
-		return err
-	}
-	logger.Info("connected to kafka", "brokers", cfg.KafkaBrokers, "topic", cfg.KafkaTopic)
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(collectors.NewGoCollector())
+	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	m := metrics.New(reg)
 
-	if err := clickhousecheck.Ping(connectCtx, clickhousecheck.Options{
+	connectCtx, cancelConnect := context.WithTimeout(context.Background(), cfg.ConnectTimeout)
+	defer cancelConnect()
+
+	ch, err := chwriter.New(connectCtx, chwriter.Options{
 		Addr:     cfg.ClickHouseAddr,
 		Database: cfg.ClickHouseDB,
 		User:     cfg.ClickHouseUser,
 		Password: cfg.ClickHousePass,
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 	logger.Info("connected to clickhouse", "addr", cfg.ClickHouseAddr, "database", cfg.ClickHouseDB)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
+	cons, err := consumer.New(consumer.Options{
+		Brokers:        cfg.KafkaBrokers,
+		Topic:          cfg.KafkaTopic,
+		Group:          cfg.KafkaGroup,
+		MaxBatchSize:   cfg.BatchMaxSize,
+		FlushInterval:  cfg.FlushInterval,
+		QueueCapacity:  cfg.QueueCapacity,
+		InitialBackoff: cfg.InitialBackoff,
+		MaxBackoff:     cfg.MaxBackoff,
+	}, logger, m, ch)
+	if err != nil {
+		_ = ch.Close()
+		return err
+	}
+	logger.Info("connected to kafka", "brokers", cfg.KafkaBrokers, "topic", cfg.KafkaTopic, "group", cfg.KafkaGroup)
 
-	httpServer := httpserver.New(cfg.HTTPAddr)
+	lag := lagreporter.New(cons.Client(), cfg.KafkaGroup, cfg.LagReportPeriod, logger, m)
+	go lag.Run(ctx)
+
+	httpServer := httpserver.New(cfg.HTTPAddr, reg)
 	errCh := make(chan error, 1)
-
 	go func() {
 		logger.Info("http server listening", "addr", cfg.HTTPAddr)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -65,19 +88,31 @@ func run(logger *slog.Logger) error {
 		}
 	}()
 
+	consumerDone := make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		cons.Run(ctx)
+	}()
+
 	select {
 	case <-ctx.Done():
 		logger.Info("shutdown signal received, draining")
 	case err := <-errCh:
+		stop()
+		<-consumerDone
+		cons.Close()
+		_ = ch.Close()
 		return err
 	}
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-	defer shutdownCancel()
+	<-consumerDone // consumer.Run performs its own final flush on ctx.Done
 
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		return err
-	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel()
+	_ = httpServer.Shutdown(shutdownCtx)
+
+	cons.Close()
+	_ = ch.Close()
 
 	logger.Info("shutdown complete")
 	return nil
