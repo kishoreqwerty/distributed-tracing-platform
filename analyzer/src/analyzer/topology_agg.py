@@ -9,6 +9,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from analyzer.reassembly import SpanRow, resolved_parent_child_pairs
+from analyzer.statutil import percentile
 
 _ERROR_STATUS_CODE = 2  # OTLP Status.StatusCode.STATUS_CODE_ERROR
 
@@ -50,22 +51,9 @@ def aggregate_edges(rows: list[SpanRow], window_start: float) -> list[ServiceEdg
                 callee_service=callee,
                 call_count=len(children),
                 error_count=error_count,
-                latency_p50_ms=_percentile(durations_ms, 50),
-                latency_p95_ms=_percentile(durations_ms, 95),
-                latency_p99_ms=_percentile(durations_ms, 99),
+                latency_p50_ms=percentile(durations_ms, 50),
+                latency_p95_ms=percentile(durations_ms, 95),
+                latency_p99_ms=percentile(durations_ms, 99),
             )
         )
     return edges
-
-
-def _percentile(sorted_values: list[float], pct: float) -> float:
-    """Linear-interpolation percentile over an already-sorted list."""
-    if not sorted_values:
-        return 0.0
-    if len(sorted_values) == 1:
-        return sorted_values[0]
-    rank = (pct / 100) * (len(sorted_values) - 1)
-    lo = int(rank)
-    hi = min(lo + 1, len(sorted_values) - 1)
-    frac = rank - lo
-    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * frac

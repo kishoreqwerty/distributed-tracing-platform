@@ -15,6 +15,7 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 
 	"github.com/kishoresj/distributed-tracing-platform/loadgen/internal/spanplan"
+	"github.com/kishoresj/distributed-tracing-platform/loadgen/internal/topology"
 )
 
 const (
@@ -26,6 +27,9 @@ const (
 	)`
 	insertClockOffsetsQuery = `INSERT INTO tracing.ground_truth_clock_offsets (
 		run_id, service_name, offset_ns
+	)`
+	insertIncidentsQuery = `INSERT INTO tracing.ground_truth_incidents (
+		run_id, incident_id, type, target_service, target_edge, start_time, end_time, magnitude
 	)`
 )
 
@@ -132,6 +136,37 @@ func (w *Writer) RecordClockOffsets(ctx context.Context, runID string, offsets m
 	}
 	if err := batch.Send(); err != nil {
 		return fmt.Errorf("send ground_truth_clock_offsets batch: %w", err)
+	}
+	return nil
+}
+
+// RecordIncidents writes the resolved (absolute-time) ground truth for
+// every incident configured on this run — called once after generation
+// finishes, mirroring RecordClockOffsets. target_edge is stored as
+// "caller->callee" for edge-scoped incidents, empty for service-scoped
+// ones (matching target_service's emptiness the other way around).
+func (w *Writer) RecordIncidents(ctx context.Context, runID string, incidents []topology.ResolvedIncident) error {
+	if len(incidents) == 0 {
+		return nil
+	}
+	batch, err := w.conn.PrepareBatch(ctx, insertIncidentsQuery)
+	if err != nil {
+		return fmt.Errorf("prepare ground_truth_incidents batch: %w", err)
+	}
+	for _, inc := range incidents {
+		targetEdge := ""
+		if inc.TargetCaller != "" {
+			targetEdge = inc.TargetCaller + "->" + inc.TargetCallee
+		}
+		if err := batch.Append(
+			runID, inc.ID, string(inc.Type), inc.TargetService, targetEdge, inc.Start, inc.End, inc.Magnitude,
+		); err != nil {
+			_ = batch.Abort()
+			return fmt.Errorf("append ground_truth_incidents row: %w", err)
+		}
+	}
+	if err := batch.Send(); err != nil {
+		return fmt.Errorf("send ground_truth_incidents batch: %w", err)
 	}
 	return nil
 }

@@ -40,6 +40,18 @@ class Metrics:
             "Time to fetch, reassemble, and write one window.",
             registry=registry,
         )
+        self.detections_total = Counter(
+            "analyzer_detections_total",
+            "Anomaly detections fired, by detector and target type.",
+            ["detector", "target_type"],
+            registry=registry,
+        )
+        self.baselines_cold_total = Counter(
+            "analyzer_baselines_cold_total",
+            "Targets whose baseline was below the cold-start sample threshold this window, by target type.",
+            ["target_type"],
+            registry=registry,
+        )
 
 
 def new_registry() -> CollectorRegistry:

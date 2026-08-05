@@ -188,3 +188,119 @@ CREATE TABLE IF NOT EXISTS tracing.ground_truth_clock_offsets
 )
 ENGINE = MergeTree
 ORDER BY (run_id, service_name);
+
+-- ground_truth_incidents: Phase 3's ground truth — every incident
+-- loadgen's topology generator actually scheduled for a run, resolved to
+-- absolute wall-clock time (see loadgen/internal/topology/incident.go's
+-- ActivateIncidents). target_service is set for service-scoped incident
+-- types (latency_spike, latency_tail, error_burst), target_edge (as
+-- "caller->callee") for edge-scoped ones (throughput_drop,
+-- edge_disappearance) — exactly one of the two is non-empty per row.
+-- Distinct from ground_truth_clock_offsets and the rest of Phase 2's
+-- ground truth tables: incidents are real behavior changes in the
+-- simulated system, not corruption of how spans about a healthy system
+-- get delivered — see docs/DECISIONS.md.
+CREATE TABLE IF NOT EXISTS tracing.ground_truth_incidents
+(
+    run_id          String,
+    incident_id     String,
+    type            LowCardinality(String),
+    target_service  LowCardinality(String) DEFAULT '',
+    target_edge     LowCardinality(String) DEFAULT '',
+    start_time      DateTime64(9),
+    end_time        DateTime64(9),
+    magnitude       Float64,
+    generated_at    DateTime64(9) DEFAULT now64(9)
+)
+ENGINE = MergeTree
+ORDER BY (run_id, incident_id);
+
+-- service_stats: per-window, per-service aggregation of a service's own
+-- spans, regardless of caller — latency/error/call-count. The
+-- service-scoped counterpart to service_edges; feeds both service-level
+-- anomaly detection and the call-rate baseline's per-window history (see
+-- analyzer/src/analyzer/baseline.py).
+CREATE TABLE IF NOT EXISTS tracing.service_stats
+(
+    window_start     DateTime64(9),
+    service_name       LowCardinality(String),
+    call_count            UInt32,
+    error_count             UInt32,
+    latency_p50_ms            Float64,
+    latency_p95_ms              Float64,
+    latency_p99_ms                Float64,
+    processed_at                    DateTime64(9) DEFAULT now64(9)
+)
+ENGINE = ReplacingMergeTree(processed_at)
+ORDER BY (service_name, window_start);
+
+-- service_baselines / edge_baselines: the analyzer's rolling baseline for
+-- each service / edge, written every window purely for observability.
+-- The analyzer never reads these back to reconstruct state — every
+-- baseline is recomputed fresh each window from spans/service_stats/
+-- service_edges, which is what actually makes a baseline survive a
+-- restart (there's no in-process warm-up state to lose). See
+-- analyzer/src/analyzer/baseline.py's module docstring and
+-- docs/DECISIONS.md.
+CREATE TABLE IF NOT EXISTS tracing.service_baselines
+(
+    as_of                  DateTime64(9),
+    service_name             LowCardinality(String),
+    call_count_observed        UInt32,
+    latency_median_ms            Float64,
+    latency_mad_ms                  Float64,
+    error_rate                        Float64,
+    call_rate_median                    Float64,
+    call_rate_mad                          Float64,
+    ready                                     UInt8,
+    processed_at                                DateTime64(9) DEFAULT now64(9)
+)
+ENGINE = ReplacingMergeTree(processed_at)
+ORDER BY (service_name, as_of);
+
+CREATE TABLE IF NOT EXISTS tracing.edge_baselines
+(
+    as_of                  DateTime64(9),
+    caller_service            LowCardinality(String),
+    callee_service               LowCardinality(String),
+    call_count_observed             UInt32,
+    latency_median_ms                  Float64,
+    latency_mad_ms                        Float64,
+    error_rate                              Float64,
+    call_rate_median                          Float64,
+    call_rate_mad                                Float64,
+    ready                                          UInt8,
+    processed_at                                     DateTime64(9) DEFAULT now64(9)
+)
+ENGINE = ReplacingMergeTree(processed_at)
+ORDER BY (caller_service, callee_service, as_of);
+
+-- detections: one row per (target, detector, window) where a detector
+-- fired. Raw and unsuppressed — Phase 3's alert-suppression/grouping
+-- layer is a separate, later piece of work; until it exists, expect many
+-- detections per real incident (one per window the incident spans), not
+-- one row per incident.
+--
+-- ORDER BY includes detector, not just (target_type, target, window_start)
+-- — a target can legitimately trip more than one detector in the same
+-- window (e.g. a latency spike that also drags its call rate down), and
+-- each is a distinct fact. Getting this wrong the first time (leaving
+-- detector out) meant ReplacingMergeTree treated two different
+-- detectors' rows for the same target+window as versions of "the same"
+-- row and silently kept only one — found live, not in a test, since no
+-- unit test exercises ClickHouse's own merge behavior. See
+-- docs/ISSUES.md.
+CREATE TABLE IF NOT EXISTS tracing.detections
+(
+    window_start     DateTime64(9),
+    target_type        LowCardinality(String),   -- 'service' | 'edge'
+    target                LowCardinality(String), -- service name, or 'caller->callee'
+    detector                 LowCardinality(String), -- 'percentile_deviation' | 'error_rate' | 'call_rate'
+    severity                    LowCardinality(String), -- 'warning' | 'critical'
+    observed_value                 Float64,
+    baseline_value                    Float64,
+    deviation                            Float64,
+    processed_at                            DateTime64(9) DEFAULT now64(9)
+)
+ENGINE = ReplacingMergeTree(processed_at)
+ORDER BY (target_type, target, detector, window_start);

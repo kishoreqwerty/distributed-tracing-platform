@@ -14,15 +14,22 @@ import (
 //go:embed default.yaml
 var defaultYAML []byte
 
-// Config is a synthetic system: a root service, the services in it, and
-// the call edges between them.
+// Config is a synthetic system: a root service, the services in it, the
+// call edges between them, and any incidents scheduled against it (see
+// incident.go).
 type Config struct {
-	Root     string        `yaml:"root"`
-	Services []ServiceSpec `yaml:"services"`
-	Edges    []EdgeSpec    `yaml:"edges"`
+	Root      string         `yaml:"root"`
+	Services  []ServiceSpec  `yaml:"services"`
+	Edges     []EdgeSpec     `yaml:"edges"`
+	Incidents []IncidentSpec `yaml:"incidents"`
 
 	byService map[string]ServiceSpec
 	outgoing  map[string][]EdgeSpec
+
+	// incidentWindows is Incidents resolved to absolute wall-clock time —
+	// see ActivateIncidents. Empty (and every incident lookup a no-op)
+	// until that's been called.
+	incidentWindows []incidentWindow
 }
 
 // ServiceSpec describes one service's simulated latency.
@@ -111,6 +118,15 @@ func (c *Config) validate() error {
 			return fmt.Errorf("topology: edge %s->%s call_probability must be in (0, 1], got %v", e.Caller, e.Callee, e.CallProbability)
 		}
 		c.outgoing[e.Caller] = append(c.outgoing[e.Caller], e)
+	}
+
+	for i := range c.Incidents {
+		if c.Incidents[i].ID == "" {
+			c.Incidents[i].ID = fmt.Sprintf("%s-%d", c.Incidents[i].Type, i)
+		}
+		if err := c.Incidents[i].validate(c.byService, c.outgoing); err != nil {
+			return err
+		}
 	}
 
 	return nil

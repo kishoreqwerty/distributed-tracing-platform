@@ -57,6 +57,14 @@ type flags struct {
 
 	clockSkewRate      float64
 	clockSkewMaxOffset time.Duration
+
+	incidentType          string
+	incidentTargetService string
+	incidentTargetCaller  string
+	incidentTargetCallee  string
+	incidentMagnitude     float64
+	incidentStart         time.Duration
+	incidentDuration      time.Duration
 }
 
 func parseFlags() flags {
@@ -86,6 +94,14 @@ func parseFlags() flags {
 	flag.Float64Var(&f.clockSkewRate, "clock-skew-rate", 0, "probability each non-root service's clock is skewed by a constant offset")
 	flag.DurationVar(&f.clockSkewMaxOffset, "clock-skew-max-offset", 2*time.Second, "maximum magnitude of a skewed service's clock offset (positive or negative)")
 
+	flag.StringVar(&f.incidentType, "incident-type", "", "inject one incident: latency_spike|latency_tail|error_burst|throughput_drop|edge_disappearance (default: none)")
+	flag.StringVar(&f.incidentTargetService, "incident-target-service", "", "target service for a service-scoped incident type")
+	flag.StringVar(&f.incidentTargetCaller, "incident-target-caller", "", "target edge caller for an edge-scoped incident type")
+	flag.StringVar(&f.incidentTargetCallee, "incident-target-callee", "", "target edge callee for an edge-scoped incident type")
+	flag.Float64Var(&f.incidentMagnitude, "incident-magnitude", 0, "incident severity; meaning depends on type — see topology.IncidentSpec")
+	flag.DurationVar(&f.incidentStart, "incident-start", 0, "delay from run start until the incident begins")
+	flag.DurationVar(&f.incidentDuration, "incident-duration", 0, "how long the incident lasts")
+
 	flag.Parse()
 	return f
 }
@@ -108,6 +124,21 @@ func run(logger *slog.Logger, f flags) error {
 	cfg, err := loadTopology(f.topologyPath)
 	if err != nil {
 		return err
+	}
+
+	if f.incidentType != "" {
+		spec := topology.IncidentSpec{
+			Type:          topology.IncidentType(f.incidentType),
+			TargetService: f.incidentTargetService,
+			TargetCaller:  f.incidentTargetCaller,
+			TargetCallee:  f.incidentTargetCallee,
+			StartOffset:   f.incidentStart,
+			Duration:      f.incidentDuration,
+			Magnitude:     f.incidentMagnitude,
+		}
+		if err := cfg.AddIncident(spec); err != nil {
+			return fmt.Errorf("incident flags: %w", err)
+		}
 	}
 
 	runID := f.runID
@@ -152,6 +183,12 @@ func run(logger *slog.Logger, f flags) error {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// Fixed once, here, as the single reference point every incident's
+	// StartOffset/Duration is resolved against — not per-trace like the
+	// timestamps Generate assigns spans, which need their own fresh
+	// time.Now() each call. See topology.Config.ActivateIncidents.
+	cfg.ActivateIncidents(time.Now())
+
 	var st stats
 	var wg sync.WaitGroup
 
@@ -160,6 +197,7 @@ func run(logger *slog.Logger, f flags) error {
 		"run_id", runID, "seed", seed,
 		"out_of_order_rate", f.outOfOrderRate, "drop_rate", f.dropRate, "late_arrival_rate", f.lateArrivalRate,
 		"clock_skew_rate", f.clockSkewRate,
+		"incident_type", f.incidentType, "incident_magnitude", f.incidentMagnitude,
 	)
 
 loop:
@@ -199,6 +237,12 @@ loop:
 		// first encountered during generation.
 		if err := gtWriter.RecordClockOffsets(context.Background(), runID, skewInjector.Offsets()); err != nil {
 			logger.Warn("recording clock offset ground truth failed", "error", err)
+		}
+	}
+
+	if resolved := cfg.ResolvedIncidents(); len(resolved) > 0 {
+		if err := gtWriter.RecordIncidents(context.Background(), runID, resolved); err != nil {
+			logger.Warn("recording incident ground truth failed", "error", err)
 		}
 	}
 

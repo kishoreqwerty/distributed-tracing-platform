@@ -299,3 +299,113 @@ shows up on macOS's default shell.
 **Fix:** `"${fault_flags[@]:-}"` — the explicit empty-string default
 makes the expansion well-defined under `set -u` regardless of bash
 version.
+
+## Phase 3 (deliverables 1-3: incident injection, baseline modeling, detectors)
+
+### `detections` table's `ReplacingMergeTree` key silently dropped rows when more than one detector fired on the same target in the same window
+
+**Symptom:** live verification with a real `latency_spike` incident showed
+zero `percentile_deviation` rows anywhere in `tracing.detections`, ever —
+`SELECT count() FROM detections WHERE detector = 'percentile_deviation'`
+returned 0 across the whole table, despite `detect_percentile_deviation`
+clearly computing a firing detection when I reproduced it directly against
+the exact live baseline/window values in a Python REPL (deviation ≈ 3.59,
+above the 3.5 threshold). The window's own analyzer log line reported
+`detection_count: 14` for that window, but a query afterward only ever
+showed the 11 `call_rate` detections — the other 3 (including
+`percentile_deviation`) had been computed, written, and then vanished.
+
+**Root cause:** `detections`' `ORDER BY (target_type, target,
+window_start)` didn't include `detector`. `ReplacingMergeTree` treats rows
+sharing the full `ORDER BY` tuple as versions of the *same* logical row —
+exactly what you want for, say, `service_baselines` (one row per service
+per window, genuinely a single fact), but wrong here: a target can
+legitimately trip more than one detector in the same window (a service
+that's both slow *and* whose call rate has fallen), and each is an
+independent, simultaneously-true fact, not competing versions of one
+fact. With `detector` left out of the key, `percentile_deviation` and
+`call_rate` firing on the same `(service, checkout, window)` collided,
+and only one survived ClickHouse's background merge — which one was an
+accident of merge timing, not anything meaningful.
+
+This is the kind of bug no amount of unit testing catches: `compute_baseline`,
+`detect_percentile_deviation`, and `write_detections` are all individually
+correct and covered by tests that never touch a real `ReplacingMergeTree`.
+The collision only exists in ClickHouse's own merge behavior, which is
+exactly why it only showed up once real detections were written to a real
+table and queried back later — see docs/DECISIONS.md's "Live-verified"
+notes for why the live-verification step existed at all rather than
+stopping at green unit tests.
+
+**Fix:** `ORDER BY (target_type, target, detector, window_start)` — see
+`deploy/clickhouse/init.sql`. Re-verified after the fix: the same
+`latency_spike` scenario (this time on a leaf service, `inventory`, to
+also rule out the dilution effect below) showed `percentile_deviation`
+firing on exactly the windows the incident was active, with `call_rate`
+detections for other, genuinely-affected targets in the same windows
+surviving alongside it rather than colliding.
+
+### `latency_spike` on a non-leaf service can be substantially diluted by its own children's duration
+
+**Observation, not a bug — a real, non-obvious property of the incident
+model worth understanding before reading its output.** The generator's
+span duration is `max(own_latency, time_until_last_child_returns)` (see
+`topology/generate.go`) — a parent span's recorded duration already
+reflects whichever is larger: its own processing time, or how long its
+downstream calls took. `checkout`'s baseline duration (~71ms) is mostly
+*children's* cumulative time (its own configured mean is 25ms); a 5x
+`latency_spike` on `checkout` multiplies only the 25ms *own* component to
+~125ms, which does exceed the pre-incident ~46ms children contribution
+and does show up — but the resulting shift (~71ms to ~125-143ms) is
+roughly 2x, not the full 5x the magnitude nominally specifies, because
+the baseline was never dominated by the component being multiplied in
+the first place.
+
+This isn't wrong, but it means `Magnitude` on `latency_spike` should be
+read as "how much I'm inflating this service's *own* processing time,"
+not "how much I'm inflating what you'll observe in its total span
+duration" — those coincide exactly on a leaf service (no children, so
+own-time *is* total time) and diverge for a service whose recorded
+duration is mostly downstream latency. Confirmed by direct comparison:
+the same 5x magnitude on `inventory` (a leaf) produced a clean ~5-6x
+p99 shift and fired `percentile_deviation` with deviation 11-14; on
+`checkout` it produced a much smaller, only-just-above-threshold shift
+(deviation ≈ 3.59, barely past the 3.5 threshold). Worth keeping in mind
+for deliverable 5's eventual sweep: incident magnitude isn't uniformly
+comparable across targets at different depths in the call tree.
+
+### Back-to-back short loadgen runs produce widespread false-positive `call_rate` detections at every run boundary — a test-methodology finding, not a detector bug
+
+**Observation, found while live-verifying the three incident types.**
+Running three separate ~40s loadgen invocations back to back (one per
+incident type, immediately following each other) produced `call_rate`
+"critical" detections on nearly *every* service and edge — including ones
+with no incident at all — clustered at the windows spanning each run's
+start and end. Re-running the same `latency_spike` scenario as a single
+continuous 120s run (incident scheduled mid-run via `--incident-start`,
+rather than as its own separate process) instead produced detections
+*only* on the actual incident's target, with clean silence on every
+unrelated service/edge through the run's steady middle.
+
+**Root cause:** `call_rate` genuinely did drop at those windows — a
+finite loadgen process ramps from zero traffic at its own start and back
+to zero at its own end, and epoch-aligned 20s analyzer windows aren't
+aligned to an arbitrary process's start/stop times, so the windows
+straddling a process boundary get a partial, lower-than-steady-state call
+count for *every* target, not just an incident's. The detector isn't
+malfunctioning — it's correctly reporting that call rate really did fall,
+just for a reason (the load generator itself starting or stopping) that
+has nothing to do with the simulated system's health.
+
+**Implication, not yet acted on:** this doesn't need a code fix — it's a
+property of how the test harness generates traffic, not of the detection
+logic — but it means deliverable 5's eventual fault sweep needs a
+different harness shape than Phase 2's (one short discrete loadgen
+process per sweep point) if `call_rate`'s false-positive rate is going to
+be measured honestly: either one long continuous run per sweep point with
+the incident scheduled inside it via `--incident-start`/`--incident-duration`,
+or explicit exclusion of the first/last window of any short run from a
+false-positive count. Flagging this now, before that harness gets built,
+rather than discovering it after a sweep's false-positive numbers turn
+out to be dominated by an artifact of the harness rather than the
+detector.

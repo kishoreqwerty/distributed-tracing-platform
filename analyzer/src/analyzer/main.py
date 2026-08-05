@@ -12,7 +12,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from analyzer import chclient, clockskew, config, httpserver, metrics, reader, reassembly, topology_agg, writer
+from analyzer import baseline, chclient, clockskew, config, detectors, httpserver, metrics, reader, reassembly, service_agg, topology_agg, writer
 from analyzer.windowing import DueWindow, WindowTracker
 
 log = logging.getLogger("analyzer")
@@ -92,11 +92,16 @@ def process_window(client, cfg: config.Config, m: metrics.Metrics, window: DueWi
     edges = topology_agg.aggregate_edges(rows, window_start=window.start)
     writer.write_service_edges(client, cfg.clickhouse_db, edges)
 
+    services = service_agg.aggregate_services(rows, window_start=window.start)
+    writer.write_service_stats(client, cfg.clickhouse_db, services)
+
     violations = clockskew.detect_violations(rows)
     for v in violations:
         m.clock_violations_total.labels(service=v.child.service_name).inc()
     offsets = clockskew.estimate_offsets(rows, root_service=cfg.root_service)
     writer.write_clock_offsets(client, cfg.clickhouse_db, window.start, offsets)
+
+    detection_count = run_detection(client, cfg, m, window, services, edges)
 
     duration = time.monotonic() - start
     m.window_processing_duration_seconds.observe(duration)
@@ -112,9 +117,72 @@ def process_window(client, cfg: config.Config, m: metrics.Metrics, window: DueWi
             "incomplete_count": sum(1 for s in result.summaries if not s.complete),
             "edge_count": len(edges),
             "clock_violation_count": len(violations),
+            "detection_count": detection_count,
             "duration_seconds": round(duration, 4),
         },
     )
+
+
+def run_detection(
+    client,
+    cfg: config.Config,
+    m: metrics.Metrics,
+    window: DueWindow,
+    services: list[service_agg.ServiceStats],
+    edges: list[topology_agg.ServiceEdge],
+) -> int:
+    """Refreshes service/edge baselines from the trailing lookback, runs
+    every detector against the current window, and writes both back to
+    ClickHouse. Returns the number of detections fired, for logging.
+    """
+    service_baselines, edge_baselines = baseline.refresh_baselines(
+        client, cfg.clickhouse_db, window.start, cfg.baseline_lookback_seconds, cfg.baseline_min_samples
+    )
+    writer.write_service_baselines(client, cfg.clickhouse_db, window.start, list(service_baselines.values()))
+    writer.write_edge_baselines(client, cfg.clickhouse_db, window.start, list(edge_baselines.values()))
+    for target_type, baselines in (("service", service_baselines), ("edge", edge_baselines)):
+        cold = sum(1 for b in baselines.values() if not b.ready)
+        if cold:
+            m.baselines_cold_total.labels(target_type=target_type).inc(cold)
+
+    current_service_stats = {
+        detectors.TargetKey("service", "", s.service_name): detectors.WindowStats(
+            target=detectors.TargetKey("service", "", s.service_name),
+            call_count=s.call_count,
+            error_count=s.error_count,
+            latency_p50_ms=s.latency_p50_ms,
+            latency_p95_ms=s.latency_p95_ms,
+            latency_p99_ms=s.latency_p99_ms,
+        )
+        for s in services
+    }
+    current_edge_stats = {
+        detectors.TargetKey("edge", e.caller_service, e.callee_service): detectors.WindowStats(
+            target=detectors.TargetKey("edge", e.caller_service, e.callee_service),
+            call_count=e.call_count,
+            error_count=e.error_count,
+            latency_p50_ms=e.latency_p50_ms,
+            latency_p95_ms=e.latency_p95_ms,
+            latency_p99_ms=e.latency_p99_ms,
+        )
+        for e in edges
+    }
+
+    all_detections: list[detectors.Detection] = []
+    for current, baselines in ((current_service_stats, service_baselines), (current_edge_stats, edge_baselines)):
+        all_detections += detectors.detect_percentile_deviation(
+            current, baselines, window.start, cfg.percentile_deviation_threshold
+        )
+        all_detections += detectors.detect_error_rate_change(
+            current, baselines, window.start, cfg.error_rate_min_sample_size, cfg.error_rate_threshold
+        )
+        all_detections += detectors.detect_call_rate_drop(current, baselines, window.start, cfg.call_rate_threshold)
+
+    writer.write_detections(client, cfg.clickhouse_db, all_detections)
+    for d in all_detections:
+        m.detections_total.labels(detector=d.detector, target_type=d.target.kind).inc()
+
+    return len(all_detections)
 
 
 def check_late_spans(client, cfg: config.Config, m: metrics.Metrics, boundary: float, since: datetime) -> None:

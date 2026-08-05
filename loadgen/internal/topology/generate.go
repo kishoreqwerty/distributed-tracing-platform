@@ -66,13 +66,17 @@ func (g *generator) generateSubtree(service string, parentSpanID []byte, start t
 	}
 
 	spanID = newRandomID(8)
+	status := tracepb.Status_STATUS_CODE_OK
+	if errMag := g.cfg.activeErrorBurstMagnitude(service, start); errMag > 0 && g.rng.Float64() < errMag {
+		status = tracepb.Status_STATUS_CODE_ERROR
+	}
 	span := &tracepb.Span{
 		TraceId:      g.traceID,
 		SpanId:       spanID,
 		ParentSpanId: parentSpanID,
 		Name:         service + ".handle",
 		Kind:         tracepb.Span_SPAN_KIND_SERVER,
-		Status:       &tracepb.Status{Code: tracepb.Status_STATUS_CODE_OK},
+		Status:       &tracepb.Status{Code: status},
 	}
 	*g.plan = append(*g.plan, spanplan.PlannedSpan{Span: span, Service: service})
 
@@ -89,7 +93,7 @@ func (g *generator) generateSubtree(service string, parentSpanID []byte, start t
 		if childPath[edge.Callee] {
 			continue
 		}
-		if g.rng.Float64() > edge.CallProbability {
+		if g.rng.Float64() > g.cfg.effectiveCallProbability(edge, start) {
 			continue
 		}
 
@@ -104,7 +108,7 @@ func (g *generator) generateSubtree(service string, parentSpanID []byte, start t
 		offset += childEnd.Sub(childStart) + callGap
 	}
 
-	ownLatency := drawLatency(g.rng, spec.LatencyMS)
+	ownLatency := g.drawLatency(service, spec.LatencyMS, start)
 	end = start.Add(ownLatency)
 	if hadChild && lastEnd.After(end) {
 		end = lastEnd
@@ -122,6 +126,30 @@ func drawLatency(rng *rand.Rand, spec LatencySpec) time.Duration {
 		ms = minLatencyMS
 	}
 	return time.Duration(ms * float64(time.Millisecond))
+}
+
+// drawLatency draws service's latency for a span starting at start,
+// applying any active latency_spike (shifts the whole distribution by
+// multiplying its mean before sampling) and latency_tail (independently,
+// with probability latencyTailFraction, multiplies just this one draw)
+// incidents. Multiple simultaneously-active latency_spike incidents on
+// the same service compose multiplicatively — an uncommon case in
+// practice (the sweep only ever schedules one incident at a time) but
+// well-defined if a hand-authored topology YAML ever does it.
+func (g *generator) drawLatency(service string, spec LatencySpec, start time.Time) time.Duration {
+	effective := spec
+	for _, w := range g.cfg.activeServiceIncidents(service, start, IncidentLatencySpike) {
+		effective.Mean *= w.spec.Magnitude
+	}
+
+	d := drawLatency(g.rng, effective)
+
+	for _, w := range g.cfg.activeServiceIncidents(service, start, IncidentLatencyTail) {
+		if g.rng.Float64() < latencyTailFraction {
+			d = time.Duration(float64(d) * w.spec.Magnitude)
+		}
+	}
+	return d
 }
 
 // newRandomID uses crypto/rand, not the caller-supplied *rand.Rand — trace

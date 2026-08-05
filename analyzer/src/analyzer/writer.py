@@ -9,8 +9,11 @@ from datetime import datetime, timezone
 
 from clickhouse_connect.driver.client import Client
 
+from analyzer.baseline import Baseline
 from analyzer.clockskew import ServiceOffset
+from analyzer.detectors import Detection
 from analyzer.reassembly import ReassemblyResult
+from analyzer.service_agg import ServiceStats
 from analyzer.topology_agg import ServiceEdge
 
 
@@ -95,6 +98,142 @@ def write_clock_offsets(client: Client, database: str, window_start: float, offs
             for o in offsets.values()
         ],
         column_names=["window_start", "service_name", "offset_ns", "confidence"],
+    )
+
+
+def write_service_stats(client: Client, database: str, stats: list[ServiceStats]) -> None:
+    if not stats:
+        return
+    client.insert(
+        f"{database}.service_stats",
+        [
+            [
+                _to_datetime(s.window_start),
+                s.service_name,
+                s.call_count,
+                s.error_count,
+                s.latency_p50_ms,
+                s.latency_p95_ms,
+                s.latency_p99_ms,
+            ]
+            for s in stats
+        ],
+        column_names=[
+            "window_start",
+            "service_name",
+            "call_count",
+            "error_count",
+            "latency_p50_ms",
+            "latency_p95_ms",
+            "latency_p99_ms",
+        ],
+    )
+
+
+def write_service_baselines(client: Client, database: str, as_of: float, baselines: list[Baseline]) -> None:
+    """baselines must all be target.kind == "service" — see
+    write_edge_baselines for edges. Written purely for observability; see
+    baseline.py's module docstring for why the analyzer never reads these
+    back.
+    """
+    if not baselines:
+        return
+    client.insert(
+        f"{database}.service_baselines",
+        [
+            [
+                _to_datetime(as_of),
+                b.target.callee,
+                b.call_count_observed,
+                b.latency_median_ms,
+                b.latency_mad_ms,
+                b.error_rate,
+                b.call_rate_median,
+                b.call_rate_mad,
+                1 if b.ready else 0,
+            ]
+            for b in baselines
+        ],
+        column_names=[
+            "as_of",
+            "service_name",
+            "call_count_observed",
+            "latency_median_ms",
+            "latency_mad_ms",
+            "error_rate",
+            "call_rate_median",
+            "call_rate_mad",
+            "ready",
+        ],
+    )
+
+
+def write_edge_baselines(client: Client, database: str, as_of: float, baselines: list[Baseline]) -> None:
+    """baselines must all be target.kind == "edge" — see
+    write_service_baselines for services.
+    """
+    if not baselines:
+        return
+    client.insert(
+        f"{database}.edge_baselines",
+        [
+            [
+                _to_datetime(as_of),
+                b.target.caller,
+                b.target.callee,
+                b.call_count_observed,
+                b.latency_median_ms,
+                b.latency_mad_ms,
+                b.error_rate,
+                b.call_rate_median,
+                b.call_rate_mad,
+                1 if b.ready else 0,
+            ]
+            for b in baselines
+        ],
+        column_names=[
+            "as_of",
+            "caller_service",
+            "callee_service",
+            "call_count_observed",
+            "latency_median_ms",
+            "latency_mad_ms",
+            "error_rate",
+            "call_rate_median",
+            "call_rate_mad",
+            "ready",
+        ],
+    )
+
+
+def write_detections(client: Client, database: str, detections: list[Detection]) -> None:
+    if not detections:
+        return
+    client.insert(
+        f"{database}.detections",
+        [
+            [
+                _to_datetime(d.window_start),
+                d.target.kind,
+                d.target.label(),
+                d.detector,
+                d.severity,
+                d.observed_value,
+                d.baseline_value,
+                d.deviation,
+            ]
+            for d in detections
+        ],
+        column_names=[
+            "window_start",
+            "target_type",
+            "target",
+            "detector",
+            "severity",
+            "observed_value",
+            "baseline_value",
+            "deviation",
+        ],
     )
 
 
