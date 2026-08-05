@@ -879,3 +879,63 @@ window-*start* markers for both bounds is also load-bearing elsewhere
 (`suppress_propagated`'s `overlaps()` check compares them the same way
 on both sides), so their meaning wasn't a good candidate for changing
 just to fix a label.
+
+### Incident rows appeared to not link to any traces — an API contract mismatch, not a missing feature
+
+**Symptom:** the trace view's empty state says "Pick a trace from the
+incidents view," implying every incident row can get you to one, but
+expanding an incident row's example-traces panel consistently showed
+"No traces landed" regardless of which incident or how wide its
+window was.
+
+**Root cause: two sides of the same parameter name meaning two
+different things, and nothing caught it because both type-checked.**
+`GET /api/traces`' `service` query parameter has only ever filtered on
+`trace_summaries.root_service` — `routes.py` documents this exactly
+(`Query(None, description="Filter to this root_service")`), and
+`queries.py`'s `fetch_traces` implements it as a plain
+`root_service = %(service)s` condition. `ExampleTraces`
+(`IncidentsView.tsx`), written independently against the client's
+`fetchTraces(range, { service, limit })` signature, passed the
+incident's own target service — reasonably assuming, from the
+parameter's name alone, that it meant "a trace that touched this
+service anywhere," which is the far more generally useful thing an
+incident-investigation view would actually want. Both sides compile
+and type-check cleanly: `service` is `string | undefined` on both the
+Pydantic schema and the TypeScript client, so nothing in either
+language's type system had any way to flag that the *meaning* on each
+side didn't match, only the *shape*.
+
+**Why it silently "worked" (returned successfully, just empty) instead
+of erroring:** this topology has exactly one possible root service —
+`frontend` (`loadgen`'s `default.yaml`: `root: frontend`, and every
+trace is generated from that single entry point). Filtering by
+`root_service = "shipping"`, or `"notifications"`, or any service other
+than `frontend`, is therefore not "the query got narrower," it's "the
+query can structurally never match anything," for every incident whose
+target isn't the root itself — which in this topology is nearly every
+incident, since `frontend` rarely trips its own detector.
+`fetch_traces` behaves exactly as documented; there's no error to
+surface, just an always-empty result set that looks identical to "no
+traces really happened here."
+
+**Fix:** `ExampleTraces` no longer passes a `service` filter at all —
+it scopes purely by the incident's own time range, which is what
+`/api/traces` can actually answer without a new query. A real "any
+span in this trace touched this service" filter would need a join
+against `tracing.spans` (`trace_summaries` doesn't store which
+services a trace touched, only its root), which is more than this view
+needs badly enough to ask the API for — see `docs/DECISIONS.md`'s
+running principle of not adding an expensive query for a view that can
+get by without one. Verified live: the same incident that previously
+returned zero traces at any window width now returns real, clickable
+trace IDs.
+
+**The general lesson:** a parameter name shared between a backend route
+and a frontend client is not a contract by itself — only its
+*documented* meaning is, and that documentation lived in one docstring
+on one side (`routes.py`'s `Query(..., description=...)`) that the
+other side's author never had reason to read while writing against the
+client function's own already-plausible-sounding signature. Neither
+`schemas.py` nor `dashboard/src/api/types.ts` encodes "root service
+only" in a way a reader skimming the TypeScript alone would catch.

@@ -234,13 +234,6 @@ finding, not a hypothetical:
   single-client, single-request measurement against this project's
   current (modest) data volume — sustained-throughput and
   concurrent-load characterization is Phase 6, not yet built.
-- **The dashboard was not visually verified in a browser during
-  development** — every response shape was checked against the
-  frontend's TypeScript types directly against the live API, and every
-  component's rendering logic (orphan nesting, derived-incident
-  styling, empty/error states) is covered by `npm test`, but no
-  screenshot or interactive click-through exists confirming the
-  rendered result looks right.
 
 Full reasoning behind every non-obvious decision (not just the ones
 above) is in `docs/DECISIONS.md`; every bug actually hit during

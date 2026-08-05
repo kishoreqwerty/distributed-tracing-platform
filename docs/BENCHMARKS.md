@@ -165,11 +165,38 @@ so a pair split across windows by clock skew fails to resolve as
 attached in that window — even though the same edge type is still very
 likely represented by other, unaffected traces elsewhere, which is
 exactly why edge P/R/F1 stays perfect while attachment accuracy (a
-per-span, not per-edge-type, metric) takes the hit. This is inferred
-from the architecture, not independently isolated by an experiment
-that varies window size against skew magnitude — I'd want that
-follow-up before trusting the number to generalize past this specific
-20s/2s configuration.
+per-span, not per-edge-type, metric) takes the hit.
+
+**Confirmed, not just inferred — two independent pieces of evidence,
+one architectural and one an isolated re-run.** First, Phase 4's
+dashboard testing hit the same mechanism from the other direction and
+measured its symptoms directly: a demo run using a 5s
+`--clock-skew-max-offset` against this same 20s analyzer window
+produced `late spans detected` warnings of up to 937 spans in a single
+window and two windows that landed with `span_count: 0` despite
+continuous traffic — the exact "spans pushed past their window's
+watermark by skew" failure this section originally only hypothesized
+about (see `docs/ISSUES.md`'s Phase 4 section for the full log
+evidence).
+
+Second, and more directly: I re-ran this exact sweep point — `--rate
+100 --duration 35s --clock-skew-rate 0.25` (default 2s max offset, no
+other faults), the identical configuration that produced 93.34% above
+— against the analyzer running production defaults (60s window / 30s
+watermark) instead of the eval overlay's 20s/15s. Attachment accuracy
+recovered completely: **100.00% (15950/15950)**, up from 93.34%
+(14981/16050) at the same skew magnitude and rate, with only the
+window width changed. `run-1785968956-c0761eae`,
+`python -m analyzer.eval run-1785968956-c0761eae --json`. This
+isolates the variable this section previously couldn't: at a 2s skew
+magnitude, a 60s window (30x the skew) is comfortably wide enough that
+skewed timestamps essentially never cross a window boundary relative
+to their true parent/child, while a 20s window (10x the skew) is not.
+The relationship between skew magnitude and window width — not skew
+magnitude alone — is what determines whether this failure mode
+appears; this project doesn't yet have enough points to say where
+between 10x and 30x the effect actually starts disappearing, only that
+it's fully gone by 30x and fully present at 10x.
 
 **Baseline noise floor:** even at 0% fault rate, attachment accuracy was
 not 100% (99.92%). This is not a bug: a trace whose spans happen to
