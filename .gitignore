@@ -4,6 +4,10 @@
 /loadgen/loadgen
 *.test
 
+# sweep run artifacts
+/scripts/.loadgen-sweep-bin
+/scripts/sweep_results.jsonl
+
 # Node
 node_modules/
 dashboard/dist/

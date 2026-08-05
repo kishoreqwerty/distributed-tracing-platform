@@ -40,6 +40,7 @@ class SpanRow:
     service_name: str
     start_time_unix_nano: int
     end_time_unix_nano: int
+    status_code: int = 1  # OTLP Status.StatusCode: 0=UNSET 1=OK 2=ERROR
 
 
 @dataclass(frozen=True)
@@ -183,3 +184,26 @@ def _subtree_depth(root_span_id: str, children: dict[str, list[str]]) -> int:
             seen.add(child_id)
             queue.append((child_id, depth + 1))
     return max_depth
+
+
+def resolved_parent_child_pairs(rows: list[SpanRow]) -> list[tuple[SpanRow, SpanRow]]:
+    """Every (parent, child) pair where the child's parent_span_id resolves
+    to another span in rows — i.e. every edge that isn't a root link or an
+    orphan. Shared by topology aggregation (service_edges) and clock skew
+    detection, both of which only care "did this call actually happen and
+    resolve," not the fuller reachability/classification reassemble() does.
+    Deliberately does not exclude cycle_rejected spans — a pair inside an
+    unreachable cycle is still a real recorded call for aggregation
+    purposes, it just doesn't count toward any trace's root-attached tree.
+    """
+    by_trace: dict[str, list[SpanRow]] = defaultdict(list)
+    for row in rows:
+        by_trace[row.trace_id].append(row)
+
+    pairs: list[tuple[SpanRow, SpanRow]] = []
+    for trace_rows in by_trace.values():
+        by_id = {r.span_id: r for r in trace_rows}
+        for r in trace_rows:
+            if r.parent_span_id and r.parent_span_id in by_id:
+                pairs.append((by_id[r.parent_span_id], r))
+    return pairs

@@ -26,6 +26,12 @@ class Config:
     poll_interval_seconds: float
     late_check_interval_seconds: float
 
+    # Anchor service for clock skew estimation — see clockskew.py's module
+    # docstring for why an anchor is unavoidable. Must match the topology's
+    # actual root service; the analyzer has no other way to know it, since
+    # it never sees the topology config, only the spans it produces.
+    root_service: str
+
 
 def load() -> Config:
     return Config(
@@ -40,6 +46,7 @@ def load() -> Config:
         watermark_seconds=_env_int("ANALYZER_WATERMARK_SECONDS", 30),
         poll_interval_seconds=_env_float("ANALYZER_POLL_INTERVAL_SECONDS", 10.0),
         late_check_interval_seconds=_env_float("ANALYZER_LATE_CHECK_INTERVAL_SECONDS", 30.0),
+        root_service=_env_str("ANALYZER_ROOT_SERVICE", "frontend"),
     )
 
 

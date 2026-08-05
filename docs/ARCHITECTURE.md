@@ -1,15 +1,15 @@
 # Architecture
 
-## Components (Phase 2, partial)
+## Components (Phase 2)
 
 ```mermaid
 flowchart LR
-    loadgen["loadgen (Go)\ntopology-driven trace generator\n+ fault injection"]
+    loadgen["loadgen (Go)\ntopology-driven trace generator\n+ fault injection + ground truth"]
     collector["collector (Go)\nOTLP gRPC receiver + Kafka producer"]
     redpanda[("Redpanda\ntopic: spans (4 partitions)")]
     writer["writer (Go)\nKafka consumer -> ClickHouse batch writer"]
     clickhouse[("ClickHouse")]
-    analyzer["analyzer (Python)\ntrace reassembly"]
+    analyzer["analyzer (Python)\nreassembly + topology graph\n+ clock skew + eval"]
     prometheus["Prometheus"]
     grafana["Grafana"]
     dashboard["dashboard (React/TS)\n[empty scaffold]"]
@@ -20,22 +20,21 @@ flowchart LR
     redpanda -- "consume, group=writer" --> writer
     writer -- "batch insert: spans" --> clickhouse
     analyzer -- "read: spans, windowed" --> clickhouse
-    analyzer -- "write: trace_summaries,\nspan_classifications" --> clickhouse
+    analyzer -- "write: trace_summaries,\nspan_classifications,\nservice_edges,\nservice_clock_offsets" --> clickhouse
+    analyzer -- "eval.py: compare\nreconstruction vs\nground truth" --> clickhouse
     prometheus -- "scrape /metrics" --> collector
     prometheus -- "scrape /metrics" --> writer
     prometheus -- "scrape /metrics" --> analyzer
     grafana -- "query" --> prometheus
-    analyzer -. "not built yet:\ntopology aggregation,\nclock skew, eval" .-> clickhouse
     dashboard -. "later phase" .-> analyzer
     dashboard -. "later phase: direct query" .-> clickhouse
 ```
 
-Dotted edges are not implemented yet. `analyzer` is real now — it reads
-`spans` and writes `trace_summaries`/`span_classifications` — but only
-does trace reassembly so far; topology aggregation (`service_edges`),
-clock skew detection/correction, and the ground-truth accuracy eval
-(`eval.py`) are separate, later pieces of the same service, not yet built.
-`loadgen` gained a second outbound edge: it writes ground truth straight to
+Dotted edges are not implemented yet — only `dashboard` remains one, as an
+empty scaffold. `analyzer` now does everything this project's core
+measurement loop needs: trace reassembly, service topology aggregation,
+clock skew detection, and (`eval.py`) comparing its own reconstruction
+against loadgen's ground truth. `loadgen` writes ground truth straight to
 ClickHouse, independent of (and prior to) whatever the OTLP/fault-injected
 path actually delivers — see "Ground truth" below.
 
@@ -56,13 +55,16 @@ path actually delivers — see "Ground truth" below.
 3. **Fault** — the pristine trace is run through whichever fault injectors
    are enabled (`internal/fault`): `--drop-rate` marks spans to never
    send; `--out-of-order-rate` delays a parent's emission past its
-   children's; `--late-arrival-rate` delays a span's emission by minutes.
-   (`--clock-skew` is not implemented yet — see `docs/DECISIONS.md`.)
-   Delay is emission-time, not span content — a delayed span still claims
-   its true original `start_time`/`end_time`, it just doesn't arrive at
-   the collector until later, which is what makes it a legitimate
-   late-arrival test case for the analyzer's watermark, not a corrupted
-   span.
+   children's; `--late-arrival-rate` delays a span's emission by minutes;
+   `--clock-skew-rate` shifts a service's recorded `start_time`/`end_time`
+   by a constant offset, decided once per service per run. Delay
+   (out-of-order, late-arrival) is emission-time, not span content — a
+   delayed span still claims its true original `start_time`/`end_time`,
+   it just doesn't arrive at the collector until later, which is what
+   makes it a legitimate late-arrival test case for the analyzer's
+   watermark, not a corrupted span. Clock skew is the opposite: it *does*
+   mutate the recorded timestamps (that's the point), while emission
+   timing is untouched.
 4. **Emit** — spans due immediately are sent as one OTLP
    `ExportTraceServiceRequest`; each distinct delay value gets its own
    later `Export` call from its own goroutine, so a multi-minute
@@ -75,17 +77,25 @@ path actually delivers — see "Ground truth" below.
    `tracing.spans`, committing Kafka offsets only after a successful
    insert. (Unchanged from Phase 1 — see that phase's section below for
    the backpressure behavior.)
-7. **Reassemble** — `analyzer` polls `tracing.spans` in fixed-size,
-   epoch-aligned windows (default 60s) with a watermark delay (default
-   30s) before treating a window as closed, giving ordinarily-late spans
-   time to land. For each window, every trace present gets grouped by
-   `trace_id`, linked via `parent_span_id`, and classified — see
-   "Trace reassembly" below. Results land in `tracing.trace_summaries`
-   (one row per trace per window) and `tracing.span_classifications` (one
-   row per span).
-8. **Self-monitoring** — `prometheus` now also scrapes `analyzer`
+7. **Reassemble, aggregate, and detect** — for each due window, `analyzer`
+   fetches that window's spans once and runs three independent passes over
+   the same rows: trace reassembly (-> `trace_summaries`,
+   `span_classifications`; see "Trace reassembly" below), service topology
+   aggregation (-> `service_edges`; see "Service topology graph" below),
+   and clock skew detection (-> `service_clock_offsets`; see "Clock skew
+   detection" below). All three share one helper,
+   `reassembly.resolved_parent_child_pairs`, for "which (parent, child)
+   pairs actually resolve in this window" — see `docs/DECISIONS.md`.
+8. **Evaluate** — `analyzer/src/analyzer/eval.py`, run manually
+   (`python -m analyzer.eval <run_id>`) or by `scripts/run_sweep.sh`,
+   compares the reconstruction above against a specific run's ground
+   truth: edge precision/recall/F1, span attachment accuracy, orphan
+   classification accuracy, and clock offset error. See "Accuracy
+   evaluation" below.
+9. **Self-monitoring** — `prometheus` scrapes `analyzer`
    (`analyzer_traces_processed_total`, `analyzer_orphan_spans_total`,
    `analyzer_late_spans_total`, `analyzer_incomplete_traces_total`,
+   `analyzer_clock_violations_total`,
    `analyzer_window_processing_duration_seconds`); `grafana` has
    Prometheus wired in as a datasource, with no dashboards built yet.
 
@@ -122,17 +132,85 @@ that can happen without a genuine cycle). Reachability is seeded from both
 true roots *and* orphans, so a well-formed subtree hanging off a dropped
 parent is `ok`, not `cycle_rejected` — see `docs/DECISIONS.md`.
 
+## Service topology graph
+
+`topology_agg.py` rolls resolved parent/child span pairs up into
+service-level edges — one row per `(caller_service, callee_service)` pair
+per window in `service_edges`, with call count, error count, and p50/p95/p99
+latency. This is a flat group-by over pairs the reassembly pass already
+resolved, not a graph traversal, so the self-call case (a service calling
+itself) needs no special handling: there's no adjacency structure here
+that could loop on it, and `test_aggregate_edges_self_call` proves it.
+
+## Clock skew detection
+
+`clockskew.py` looks for parent/child pairs where causality is physically
+violated — a child recorded as starting before its parent, or outliving
+it — and estimates a per-service clock offset from the aggregate of those
+violations, never by correcting an individual span's stored timestamps
+(`docs/DECISIONS.md`'s orphan-retention row applies the same principle
+here: the stored data stays exactly what was received).
+
+Only *relative* skew is recoverable from this kind of data — nothing says
+which service (if any) has the correct clock, only that pairs disagree
+and by how much. Estimates are anchored to a root service (offset defined
+as exactly zero), and loadgen's `ClockSkewInjector` never skews the root
+for the same reason. The baseline used to convert a raw timing gap into
+an offset estimate is whichever topology edge's typical gap has the
+smallest absolute value — not, as first implemented, the median of all
+edges' typical gaps, which turned out to break badly when a single
+*hub* service (touching most of the graph's edges) was skewed. Full
+reasoning, including the real numbers this looked like before the fix,
+and the fix's own remaining limitation, are in `clockskew.py`'s module
+docstring, `docs/DECISIONS.md`, and `docs/ISSUES.md`.
+
+## Accuracy evaluation
+
+`eval.py` is deliberately split into a ClickHouse-querying half
+(`evaluate`) and a pure-Python metrics half (`compute_metrics`) that takes
+plain sets/dicts and has no database dependency — the arithmetic is the
+part worth being confident about, so it's unit-tested against hand-built
+data independent of any live run. For a given `run_id` it reports:
+
+- **Edge precision/recall/F1** — `service_edges` vs. `ground_truth_edges`,
+  correlated to the run by a time range (`service_edges` isn't
+  `run_id`-scoped — see "Ground truth" below) rather than a direct key.
+- **Span attachment accuracy** — of ground-truth spans whose true parent
+  also landed, what fraction the analyzer classified `ok`.
+- **Orphan classification accuracy** — of landed spans whose true parent
+  was dropped, what fraction were classified `orphan_missing_parent`.
+- **Clock offset error** — detected minus true, per service, for services
+  present in both.
+
+Denominators of zero (e.g. orphan accuracy on a run with no drop fault)
+report `None`/"N/A", not a fabricated `0.0` or `1.0` — see
+`docs/DECISIONS.md`.
+
+`scripts/run_sweep.sh` drives `eval.py` across the full fault sweep: each
+fault type independently, at 0/1/5/10/25%, writing one JSON line per
+sweep point. `docs/BENCHMARKS.md` has the actual measured table.
+
 ## Ground truth
 
-`loadgen` is now the only thing in this system besides `writer` that talks
-to ClickHouse directly, and it does so for one reason: ground truth has to
+`loadgen` is the only thing in this system besides `writer` that talks to
+ClickHouse directly, and it does so for one reason: ground truth has to
 reflect what was *generated*, before any fault runs, which the
 delivery-path spans in `tracing.spans` structurally cannot (that table
 only ever contains what actually survived — or didn't). Every span's
 `trace_id` is the join key between `ground_truth_spans` and `tracing.spans`;
 `run_id` for a given trace is recovered by joining through
 `ground_truth_spans` rather than adding a run-scoped column to the
-production spans table.
+production spans table. `ground_truth_clock_offsets` (one row per
+service, once `ClockSkewInjector`'s offsets are finalized at the end of a
+run) follows the same `run_id`-scoped pattern.
+
+Two of the analyzer's own output tables — `service_edges` and
+`service_clock_offsets` — are *not* `run_id`-scoped, the same as
+`trace_summaries`/`span_classifications` aren't (production tables don't
+carry a test-harness-only concept — see `docs/DECISIONS.md`'s Phase 1
+row on why `tracing.spans` itself has no `run_id` column). `eval.py`
+correlates them to a specific run by time range instead: the run's own
+`[min, max] ground_truth_spans.generated_at`, widened by a small margin.
 
 ## Backpressure: what happens when ClickHouse is slow or down
 
@@ -162,10 +240,11 @@ numbers and `integration/pipeline_test.go`'s
 /collector          Go — OTLP gRPC receiver + Kafka producer
 /writer              Go — Kafka consumer -> ClickHouse batch writer
 /loadgen             Go — topology-driven trace generator, fault injection, ground truth writer
-/analyzer            Python — trace reassembly (topology aggregation, clock skew, eval: not yet built)
+/analyzer            Python — reassembly, service topology graph, clock skew, accuracy eval (eval.py)
 /integration         Go — compose-based integration tests (build tag: integration)
+/scripts             run_sweep.sh — the deliverable-5 fault sweep driver
 /dashboard           React/TS (empty scaffold)
-/deploy              docker-compose.yml, ClickHouse init SQL, Prometheus/Grafana config
+/deploy              docker-compose.yml (+ docker-compose.eval.yml overlay), ClickHouse init SQL, Prometheus/Grafana config
 /docs                this file, DECISIONS.md, ISSUES.md, BENCHMARKS.md
 ```
 
@@ -220,3 +299,23 @@ cd analyzer
 python -m pytest                       # fast unit tests — in CI
 python -m pytest tests_integration -v  # needs a running ClickHouse — not in CI
 ```
+
+Once a run's ground truth exists and the relevant window has been
+processed (watermark passed):
+
+```sh
+python -m analyzer.eval <run_id>          # human summary
+python -m analyzer.eval <run_id> --json   # machine-readable
+```
+
+To run the full fault sweep (needs the compose stack up with the eval
+overlay applied first — shrinks window/watermark so 17 sweep points are
+tractable; see `docs/DECISIONS.md` and `docs/ISSUES.md` for why the
+overlay's specific values were chosen):
+
+```sh
+cd deploy && docker compose -f docker-compose.yml -f docker-compose.eval.yml up -d --build
+cd .. && bash scripts/run_sweep.sh
+```
+
+Writes one JSON line per sweep point to `scripts/sweep_results.jsonl`.

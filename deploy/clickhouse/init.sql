@@ -135,3 +135,56 @@ CREATE TABLE IF NOT EXISTS tracing.span_classifications
 )
 ENGINE = ReplacingMergeTree(processed_at)
 ORDER BY (trace_id, span_id);
+
+-- service_edges: span-level parent/child links rolled up into
+-- service-level call edges per processed window. caller_service =
+-- callee_service (the self-call case) is not special-cased anywhere —
+-- aggregation is a flat group-by over resolved pairs, not a graph
+-- traversal, so there is nothing for a self-edge to loop on.
+CREATE TABLE IF NOT EXISTS tracing.service_edges
+(
+    window_start     DateTime64(9),
+    caller_service     LowCardinality(String),
+    callee_service     LowCardinality(String),
+    call_count           UInt32,
+    error_count           UInt32,
+    latency_p50_ms         Float64,
+    latency_p95_ms         Float64,
+    latency_p99_ms         Float64,
+    processed_at             DateTime64(9) DEFAULT now64(9)
+)
+ENGINE = ReplacingMergeTree(processed_at)
+ORDER BY (caller_service, callee_service, window_start);
+
+-- service_clock_offsets: the analyzer's estimated per-service clock
+-- offset, relative to the root service (offset 0 by definition — see
+-- analyzer/src/analyzer/clockskew.py's module docstring for why only
+-- relative skew is recoverable at all). confidence is the number of
+-- parent/child edge observations the estimate for that service is built
+-- from in that window.
+CREATE TABLE IF NOT EXISTS tracing.service_clock_offsets
+(
+    window_start    DateTime64(9),
+    service_name     LowCardinality(String),
+    offset_ns          Int64,
+    confidence           UInt32,
+    processed_at           DateTime64(9) DEFAULT now64(9)
+)
+ENGINE = ReplacingMergeTree(processed_at)
+ORDER BY (service_name, window_start);
+
+-- ground_truth_clock_offsets: the clock offset loadgen's ClockSkewInjector
+-- actually applied to a service for a run, recorded once the run's
+-- offsets are finalized (a service's offset is decided once, the first
+-- time that service is used, and held constant for the rest of the run —
+-- see loadgen's ClockSkewInjector). Compared against
+-- service_clock_offsets by eval.py.
+CREATE TABLE IF NOT EXISTS tracing.ground_truth_clock_offsets
+(
+    run_id        String,
+    service_name    LowCardinality(String),
+    offset_ns         Int64,
+    generated_at        DateTime64(9) DEFAULT now64(9)
+)
+ENGINE = MergeTree
+ORDER BY (run_id, service_name);

@@ -1,0 +1,23 @@
+# Overlay for running the deliverable-5 fault sweep. Shrinks the
+# analyzer's window/watermark/poll cadence so a sweep point's reassembly
+# result is available in under a minute instead of the ~90-120s the
+# production defaults (60s window, 30s watermark) cost per point — see
+# docs/BENCHMARKS.md for the measured numbers. Production behavior
+# (docker-compose.yml alone) is unchanged; this file only applies when
+# explicitly layered on top of it.
+#
+# 10s/5s (window/watermark) was tried first and rejected: under a 100
+# trace/sec burst, 39% of spans arrived after their window's watermark had
+# already passed — an artifact of the writer's ~2s batch flush interval
+# plus pipeline latency, not of anything under test. 20s/15s leaves enough
+# margin above that latency that late_spans_total stays near zero on a
+# no-fault baseline — verified before this was used for the real sweep.
+#
+# Usage: docker compose -f docker-compose.yml -f docker-compose.eval.yml up -d analyzer
+services:
+  analyzer:
+    environment:
+      ANALYZER_WINDOW_SECONDS: "20"
+      ANALYZER_WATERMARK_SECONDS: "15"
+      ANALYZER_POLL_INTERVAL_SECONDS: "5"
+      ANALYZER_LATE_CHECK_INTERVAL_SECONDS: "15"

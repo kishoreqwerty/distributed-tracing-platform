@@ -54,6 +54,9 @@ type flags struct {
 	lateArrivalRate float64
 	lateArrivalMin  time.Duration
 	lateArrivalMax  time.Duration
+
+	clockSkewRate      float64
+	clockSkewMaxOffset time.Duration
 }
 
 func parseFlags() flags {
@@ -79,6 +82,9 @@ func parseFlags() flags {
 	flag.Float64Var(&f.lateArrivalRate, "late-arrival-rate", 0, "probability each span's emission is delayed by a late-arrival amount")
 	flag.DurationVar(&f.lateArrivalMin, "late-arrival-min", 2*time.Minute, "minimum late-arrival delay")
 	flag.DurationVar(&f.lateArrivalMax, "late-arrival-max", 5*time.Minute, "maximum late-arrival delay")
+
+	flag.Float64Var(&f.clockSkewRate, "clock-skew-rate", 0, "probability each non-root service's clock is skewed by a constant offset")
+	flag.DurationVar(&f.clockSkewMaxOffset, "clock-skew-max-offset", 2*time.Second, "maximum magnitude of a skewed service's clock offset (positive or negative)")
 
 	flag.Parse()
 	return f
@@ -135,7 +141,7 @@ func run(logger *slog.Logger, f flags) error {
 	defer func() { _ = gtWriter.Close() }()
 	gt := groundtruth.NewBatcher(gtWriter, runID, 1000, 2*time.Second)
 
-	injectors := buildFaultChain(f, rng)
+	injectors, skewInjector := buildFaultChain(f, cfg.Root, rng)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -153,6 +159,7 @@ func run(logger *slog.Logger, f flags) error {
 		"target", f.target, "rate_per_sec", f.rate, "duration", f.duration.String(),
 		"run_id", runID, "seed", seed,
 		"out_of_order_rate", f.outOfOrderRate, "drop_rate", f.dropRate, "late_arrival_rate", f.lateArrivalRate,
+		"clock_skew_rate", f.clockSkewRate,
 	)
 
 loop:
@@ -186,6 +193,14 @@ loop:
 	}
 
 	wg.Wait()
+
+	if skewInjector != nil {
+		// Only knowable now: offsets are decided lazily as services are
+		// first encountered during generation.
+		if err := gtWriter.RecordClockOffsets(context.Background(), runID, skewInjector.Offsets()); err != nil {
+			logger.Warn("recording clock offset ground truth failed", "error", err)
+		}
+	}
 
 	logger.Info("load generation complete",
 		"run_id", runID,
@@ -270,7 +285,10 @@ func sendGroup(em *emitter.Emitter, group []spanplan.PlannedSpan, st *stats, log
 	st.spansSendOK.Add(int64(len(group)))
 }
 
-func buildFaultChain(f flags, rng *mathrand.Rand) fault.Chain {
+// buildFaultChain returns the configured injector chain, plus the
+// ClockSkewInjector specifically (or nil) so the caller can read its
+// final offsets for ground truth once the run finishes.
+func buildFaultChain(f flags, rootService string, rng *mathrand.Rand) (fault.Chain, *fault.ClockSkewInjector) {
 	var chain fault.Chain
 	if f.outOfOrderRate > 0 {
 		chain = append(chain, &fault.OutOfOrderInjector{Rate: f.outOfOrderRate, Delay: f.outOfOrderDelay, Rand: rng})
@@ -283,10 +301,15 @@ func buildFaultChain(f flags, rng *mathrand.Rand) fault.Chain {
 			Rate: f.lateArrivalRate, MinDelay: f.lateArrivalMin, MaxDelay: f.lateArrivalMax, Rand: rng,
 		})
 	}
+	var skewInjector *fault.ClockSkewInjector
+	if f.clockSkewRate > 0 {
+		skewInjector = fault.NewClockSkewInjector(f.clockSkewRate, f.clockSkewMaxOffset, rootService, rng)
+		chain = append(chain, skewInjector)
+	}
 	if len(chain) == 0 {
 		chain = fault.Chain{fault.NoopInjector{}}
 	}
-	return chain
+	return chain, skewInjector
 }
 
 func loadTopology(path string) (*topology.Config, error) {

@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -22,6 +23,9 @@ const (
 	)`
 	insertEdgesQuery = `INSERT INTO tracing.ground_truth_edges (
 		run_id, trace_id, caller_service, callee_service
+	)`
+	insertClockOffsetsQuery = `INSERT INTO tracing.ground_truth_clock_offsets (
+		run_id, service_name, offset_ns
 	)`
 )
 
@@ -105,6 +109,30 @@ func (w *Writer) insert(ctx context.Context, spans []spanRow, edges []edgeRow) e
 		}
 	}
 
+	return nil
+}
+
+// RecordClockOffsets writes the final, decided clock offset for each
+// service in offsets — the ClockSkewInjector's ground truth, called once
+// after the run finishes (offsets are decided lazily as services are
+// first encountered, so this can't be known mid-run).
+func (w *Writer) RecordClockOffsets(ctx context.Context, runID string, offsets map[string]time.Duration) error {
+	if len(offsets) == 0 {
+		return nil
+	}
+	batch, err := w.conn.PrepareBatch(ctx, insertClockOffsetsQuery)
+	if err != nil {
+		return fmt.Errorf("prepare ground_truth_clock_offsets batch: %w", err)
+	}
+	for service, offset := range offsets {
+		if err := batch.Append(runID, service, int64(offset)); err != nil {
+			_ = batch.Abort()
+			return fmt.Errorf("append ground_truth_clock_offsets row: %w", err)
+		}
+	}
+	if err := batch.Send(); err != nil {
+		return fmt.Errorf("send ground_truth_clock_offsets batch: %w", err)
+	}
 	return nil
 }
 

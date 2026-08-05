@@ -27,7 +27,7 @@ from analyzer.reassembly import SpanRow
 
 _WINDOW_QUERY = """
 SELECT trace_id, span_id, parent_span_id, service_name,
-       start_time_unix_nano, end_time_unix_nano
+       start_time_unix_nano, end_time_unix_nano, status_code
 FROM {database}.spans FINAL
 WHERE start_time >= fromUnixTimestamp64Nano(toInt64(%(start)s * 1e9))
   AND start_time <  fromUnixTimestamp64Nano(toInt64(%(end)s * 1e9))
@@ -44,7 +44,7 @@ WHERE ingested_at > %(since)s
 def fetch_window(client: Client, database: str, start: float, end: float) -> list[SpanRow]:
     result = client.query(_WINDOW_QUERY.format(database=database), parameters={"start": start, "end": end})
     rows = []
-    for trace_id, span_id, parent_span_id, service_name, start_ns, end_ns in result.result_rows:
+    for trace_id, span_id, parent_span_id, service_name, start_ns, end_ns, status_code in result.result_rows:
         rows.append(
             SpanRow(
                 trace_id=decode_fixed_string(trace_id),
@@ -53,6 +53,7 @@ def fetch_window(client: Client, database: str, start: float, end: float) -> lis
                 service_name=service_name,
                 start_time_unix_nano=start_ns,
                 end_time_unix_nano=end_ns,
+                status_code=status_code,
             )
         )
     return rows

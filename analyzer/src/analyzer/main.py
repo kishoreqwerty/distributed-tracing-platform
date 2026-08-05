@@ -12,7 +12,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from analyzer import chclient, config, httpserver, metrics, reader, reassembly, writer
+from analyzer import chclient, clockskew, config, httpserver, metrics, reader, reassembly, topology_agg, writer
 from analyzer.windowing import DueWindow, WindowTracker
 
 log = logging.getLogger("analyzer")
@@ -89,6 +89,15 @@ def process_window(client, cfg: config.Config, m: metrics.Metrics, window: DueWi
         if classification.classification != "ok":
             m.orphan_spans_total.labels(classification=classification.classification).inc()
 
+    edges = topology_agg.aggregate_edges(rows, window_start=window.start)
+    writer.write_service_edges(client, cfg.clickhouse_db, edges)
+
+    violations = clockskew.detect_violations(rows)
+    for v in violations:
+        m.clock_violations_total.labels(service=v.child.service_name).inc()
+    offsets = clockskew.estimate_offsets(rows, root_service=cfg.root_service)
+    writer.write_clock_offsets(client, cfg.clickhouse_db, window.start, offsets)
+
     duration = time.monotonic() - start
     m.window_processing_duration_seconds.observe(duration)
 
@@ -101,6 +110,8 @@ def process_window(client, cfg: config.Config, m: metrics.Metrics, window: DueWi
             "span_count": len(rows),
             "trace_count": len(result.summaries),
             "incomplete_count": sum(1 for s in result.summaries if not s.complete),
+            "edge_count": len(edges),
+            "clock_violation_count": len(violations),
             "duration_seconds": round(duration, 4),
         },
     )

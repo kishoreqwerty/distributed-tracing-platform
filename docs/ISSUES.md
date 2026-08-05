@@ -188,3 +188,114 @@ exercised as before); only the during-outage traffic bypasses loadgen.
 This keeps the two concerns — "does loadgen's ground truth requirement
 work" and "does the writer survive a ClickHouse outage" — decoupled
 rather than compromising either one to make the other easier to test.
+
+## Phase 2 (deliverables 3-5: clock skew, service topology graph, accuracy eval)
+
+### Analyzer's eval-cadence watermark was too tight for real pipeline latency, misclassifying on-time spans as late
+
+**Symptom:** with the analyzer's window/watermark shortened for the fault
+sweep (10s window / 5s watermark, chosen only to make ~20 sweep points
+tractable in wall-clock time), a clean baseline run at 100 traces/sec
+logged `late spans detected` warnings totaling 7,612 of 19,534 spans
+generated — 39% of everything sent, despite zero faults being active.
+
+**Root cause:** the writer's batch flush interval (2s default) plus
+normal collector/Kafka/ClickHouse pipeline latency routinely exceeded a
+5-second watermark under sustained load. Spans generated near the end of
+a 10-second window were still landing in ClickHouse after that window's
+watermark had already passed — a timing artifact of the eval harness's
+own configuration, not of anything under test.
+
+**Fix:** widened the eval overlay to 20s window / 15s watermark
+(`deploy/docker-compose.eval.yml`) and re-verified: an identical clean
+baseline run produced zero late-span warnings. This is not a universal
+"right" watermark — it's calibrated against this pipeline's measured
+latency under the load this project actually generates, and would need
+re-checking if that latency profile changes.
+
+### `statistics.median()` on an even-length sample returns a `float`, breaking the `Int64` ClickHouse insert
+
+**Symptom:** the analyzer crashed writing `service_clock_offsets`:
+```
+clickhouse_connect.driver.exceptions.DataError: Unable to create Python
+array. This is usually caused by trying to insert None values into a
+ClickHouse column that is not Nullable
+```
+with the underlying cause buried one frame down: `struct.error: required
+argument is not an integer`.
+
+**Root cause:** `clockskew.estimate_offsets` computed each service's
+offset via `statistics.median()` over parent/child timing gaps. Python's
+`median()` returns the *average* of the two middle values for an
+even-length input — a `float`, even when every input was an `int` — and
+that float propagated all the way into `offset_ns`, a ClickHouse `Int64`
+column that `clickhouse-connect` cannot serialize a float into. It only
+surfaced once a window happened to have an even number of observations
+for some edge; odd-count windows never hit it, which is exactly how it
+got past initial testing before being caught live.
+
+**Fix:** `round()` the computed offset before storing it in
+`ServiceOffset.offset_ns`. Added
+`test_estimate_offsets_returns_int_with_even_sample_count`, built
+specifically with an even trace count, as a regression test — the
+existing tests all happened to use odd counts and would never have
+caught this.
+
+### Clock offset estimator's baseline was corrupted by a single skewed hub service
+
+**Symptom:** running with `--clock-skew-rate 1.0` (every non-root service
+skewed) to make the effect obviously visible, detected offsets bore no
+resemblance to true offsets — checkout and shipping, whose true offsets
+differed by roughly a second, were reported as *identical*.
+
+**Root cause:** `estimate_offsets`'s original baseline was the median of
+every edge's typical timing gap, assumed robust as long as fewer than
+half the edges were skewed. That assumption was about the wrong
+quantity: what matters is the fraction of *edges* affected, not
+*services*. checkout is the topology's hub, touching 4 of its 5 edges
+(one incoming, three outgoing) — skewing that one service alone corrupts
+80% of the edges in the graph, nowhere near the "minority" the median
+baseline needed to stay accurate.
+
+**Fix:** changed the baseline to whichever edge's typical gap has the
+smallest absolute value, not the median of all of them — see
+docs/DECISIONS.md for the reasoning and clockskew.py's docstring for the
+full explanation. This is a real improvement, verified against a
+hand-built hub-topology test case, but **not a complete fix**: rerunning
+at a realistic sweep rate (25%) with two services randomly skewed —
+including the topology's one leaf, notifications — still produced badly
+wrong estimates, because that particular combination corrupted *every*
+edge in the graph, leaving no clean edge for any baseline method to find.
+This is reported as a genuine, unresolved limitation in
+docs/BENCHMARKS.md's fault sweep, not smoothed over. See clockskew.py's
+module docstring for the honest version of what this method can and
+can't do on a topology this small.
+
+**Addendum, from the final recorded sweep:** the hub-corruption failure
+mode above needs an unlucky combination of *which* services get skewed
+and didn't reproduce in the sweep's own random draws (only `checkout`
+ended up skewed, at the 25% point, and was recovered with zero error).
+What the sweep's numbers show instead is a second, distinct problem:
+even at 0% actual skew, the baseline reports 13-51ms of "drift" for
+several services, consistently across independent runs. That's the
+"typical_gap" baseline conflating ordinary inter-service network/queueing
+latency with clock skew — it has no way to tell them apart. Both
+failure modes are real and independent of each other; see
+docs/BENCHMARKS.md for the actual numbers.
+
+### bash 3.2's `set -u` treats an empty array expansion as an unbound variable
+
+**Symptom:** `scripts/run_sweep.sh` failed immediately on its first
+(no-fault baseline) sweep point: `fault_flags[@]: unbound variable`.
+
+**Root cause:** macOS ships bash 3.2 (the last GPLv2 release) as
+`/bin/bash`, and that version's `set -u` treats `"${array[@]}"` as
+unbound when the array has zero elements — the baseline sweep point
+passes no fault flags at all, so `fault_flags` was legitimately empty.
+Later bash versions handle this case without complaint, which is exactly
+why this kind of bug survives on any machine with a modern bash and only
+shows up on macOS's default shell.
+
+**Fix:** `"${fault_flags[@]:-}"` — the explicit empty-string default
+makes the expansion well-defined under `set -u` regardless of bash
+version.

@@ -1,6 +1,4 @@
-"""Analyzer Prometheus metrics. Clock-skew metrics (analyzer_clock_violations_total)
-aren't defined here — clock skew detection is a later phase's work.
-"""
+"""Analyzer Prometheus metrics."""
 
 from __future__ import annotations
 
@@ -29,6 +27,12 @@ class Metrics:
             "analyzer_incomplete_traces_total",
             "Traces classified as incomplete, by reason.",
             ["reason"],
+            registry=registry,
+        )
+        self.clock_violations_total = Counter(
+            "analyzer_clock_violations_total",
+            "Parent/child span pairs where causality was physically violated, by the child's service.",
+            ["service"],
             registry=registry,
         )
         self.window_processing_duration_seconds = Histogram(
