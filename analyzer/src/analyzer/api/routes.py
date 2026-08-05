@@ -65,7 +65,7 @@ def list_traces(
     _validate_range(start, end, cfg)
     limit = _clamp_limit(limit, cfg)
 
-    rows, has_more = queries.fetch_traces(
+    rows, has_more, duration_filter_truncated = queries.fetch_traces(
         client, cfg.clickhouse_db, start, end, service, complete, min_duration_ms, limit, offset, cfg.api_max_rows
     )
     return schemas.TraceListResponse(
@@ -73,6 +73,7 @@ def list_traces(
         limit=limit,
         offset=offset,
         has_more=has_more,
+        duration_filter_truncated=duration_filter_truncated,
     )
 
 
@@ -92,6 +93,7 @@ def get_trace(
     return schemas.TraceDetailResponse(
         trace_id=detail.trace_id,
         spans=[schemas.Span(**s.__dict__) for s in detail.spans],
+        clock_offsets=[schemas.TraceClockOffset(**o.__dict__) for o in detail.clock_offsets],
     )
 
 

@@ -196,7 +196,8 @@ def test_get_trace_returns_spans_with_classification():
         )
     ]
     classification_rows = [(b"span1\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", "ok")]
-    fake = QueueClient(span_rows, classification_rows)
+    offset_rows = [("frontend", 50_000_000, 42)]
+    fake = QueueClient(span_rows, classification_rows, offset_rows)
     client = make_app(fake)
 
     resp = client.get(f"/api/traces/{trace_id}")
@@ -207,6 +208,106 @@ def test_get_trace_returns_spans_with_classification():
     assert len(body["spans"]) == 1
     assert body["spans"][0]["classification"] == "ok"
     assert body["spans"][0]["parent_span_id"] == ""  # root span: NUL-padded empty FixedString decodes to ""
+    assert body["clock_offsets"] == [{"service_name": "frontend", "offset_ns": 50_000_000, "confidence": 42}]
+
+
+def test_get_trace_clock_offsets_query_scoped_to_trace_services_and_start_time():
+    trace_id = "b" * 32
+    span_rows = [
+        (
+            b"span1\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            b"\x00" * 16,
+            "frontend",
+            "frontend.handle",
+            5_000_000_000,
+            5_010_000_000,
+            1,
+            {},
+        )
+    ]
+    fake = QueueClient(span_rows, [], [])
+    client = make_app(fake)
+
+    resp = client.get(f"/api/traces/{trace_id}")
+
+    assert resp.status_code == 200
+    offset_call = fake.calls[2]
+    assert offset_call[1]["services"] == ["frontend"]
+    # the trace's own start time (5_000_000_000ns = 5s past epoch), not "now"
+    assert offset_call[1]["at"] == datetime(1970, 1, 1, 0, 0, 5, tzinfo=timezone.utc)
+
+
+def test_trace_with_no_clock_offset_estimate_returns_empty_offsets():
+    trace_id = "c" * 32
+    span_rows = [
+        (
+            b"span1\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            b"\x00" * 16,
+            "frontend",
+            "frontend.handle",
+            1_000_000_000,
+            1_010_000_000,
+            1,
+            {},
+        )
+    ]
+    fake = QueueClient(span_rows, [], [])  # no offset rows at all
+    client = make_app(fake)
+
+    resp = client.get(f"/api/traces/{trace_id}")
+
+    assert resp.status_code == 200
+    assert resp.json()["clock_offsets"] == []
+
+
+# --- duration_filter_truncated ---------------------------------------------
+
+
+def test_duration_filter_truncated_when_candidates_hit_cap():
+    # TEST_CONFIG.api_max_rows == 5 — exactly 5 candidates back means the
+    # candidate fetch may have been cut off by the cap.
+    trace_rows = [
+        (f"{'a' * 31}{i}".encode(), datetime(2026, 8, 5, 12, 0, i), 1, 1, "svc", 1, "", 0) for i in range(5)
+    ]
+    fake = QueueClient(trace_rows, [])
+    client = make_app(fake)
+
+    resp = client.get(
+        "/api/traces",
+        params={"start": iso(NOW), "end": iso(NOW + timedelta(minutes=1)), "min_duration_ms": 10},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["duration_filter_truncated"] is True
+
+
+def test_duration_filter_not_truncated_when_candidates_under_cap():
+    trace_rows = [
+        (f"{'a' * 31}{i}".encode(), datetime(2026, 8, 5, 12, 0, i), 1, 1, "svc", 1, "", 0) for i in range(2)
+    ]
+    fake = QueueClient(trace_rows, [])
+    client = make_app(fake)
+
+    resp = client.get(
+        "/api/traces",
+        params={"start": iso(NOW), "end": iso(NOW + timedelta(minutes=1)), "min_duration_ms": 10},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["duration_filter_truncated"] is False
+
+
+def test_duration_filter_truncated_always_false_without_min_duration():
+    trace_rows = [
+        (f"{'a' * 31}{i}".encode(), datetime(2026, 8, 5, 12, 0, i), 1, 1, "svc", 1, "", 0) for i in range(5)
+    ]
+    fake = QueueClient(trace_rows, [])
+    client = make_app(fake)
+
+    resp = client.get("/api/traces", params={"start": iso(NOW), "end": iso(NOW + timedelta(minutes=1))})
+
+    assert resp.status_code == 200
+    assert resp.json()["duration_filter_truncated"] is False
 
 
 # --- response shape smoke tests ---------------------------------------------

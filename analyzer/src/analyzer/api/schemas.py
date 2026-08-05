@@ -28,6 +28,11 @@ class TraceListResponse(BaseModel):
     limit: int
     offset: int
     has_more: bool
+    # True when min_duration_ms was requested and the candidate set hit
+    # API_MAX_ROWS before duration filtering ran — real matches beyond
+    # the cap may exist and were never considered. Always False when
+    # min_duration_ms wasn't requested. See queries.fetch_traces.
+    duration_filter_truncated: bool
 
 
 class Span(BaseModel):
@@ -42,9 +47,22 @@ class Span(BaseModel):
     classification: str | None  # null: span exists but its window hasn't been processed by reassembly yet
 
 
+class TraceClockOffset(BaseModel):
+    service_name: str
+    offset_ns: int
+    confidence: int
+
+
 class TraceDetailResponse(BaseModel):
     trace_id: str
     spans: list[Span]
+    # Most recent offset estimate at-or-before this trace's own start,
+    # per service appearing in it — a service absent here has no
+    # estimate available at all. See queries.py's
+    # _fetch_clock_offsets_for_services and docs/DECISIONS.md for why
+    # this is resolved server-side rather than left to the frontend to
+    # join against /api/clock-offsets.
+    clock_offsets: list[TraceClockOffset]
 
 
 class ServiceEdge(BaseModel):

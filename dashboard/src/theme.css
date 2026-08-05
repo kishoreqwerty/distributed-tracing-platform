@@ -1,0 +1,409 @@
+/* Monitoring-console visual direction — see docs/DECISIONS.md.
+   Deep graphite-navy panels, hairline dividers, one monospace face for
+   every number/timestamp (real tabular figures), one sans face for
+   labels and navigation. Severity is the only place color gets loud. */
+
+:root {
+  --bg: #10141a;
+  --bg-panel: #171c24;
+  --bg-panel-raised: #1d232d;
+  --border: #2a3140;
+  --border-strong: #3a4356;
+
+  --text: #dbe1ea;
+  --text-dim: #8a93a6;
+  --text-faint: #5a6272;
+
+  --accent: #5fb8c4;
+  --accent-dim: #3d7a82;
+
+  --severity-critical: #e0625a;
+  --severity-critical-bg: #3a2220;
+  --severity-warning: #d6a24a;
+  --severity-warning-bg: #3a2f1a;
+  --severity-derived: #6b7385;
+  --severity-derived-bg: #23272f;
+  --severity-ok: #4f9e6e;
+
+  --font-data: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --font-ui: -apple-system, "Segoe UI", system-ui, sans-serif;
+
+  --radius: 3px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.data,
+.data * {
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+}
+
+button,
+input,
+select {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+a {
+  color: var(--accent);
+}
+
+::selection {
+  background: var(--accent-dim);
+  color: var(--text);
+}
+
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.hairline {
+  border-color: var(--border);
+}
+
+.text-dim {
+  color: var(--text-dim);
+}
+
+.text-faint {
+  color: var(--text-faint);
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.1em 0.5em;
+  border-radius: var(--radius);
+  font-size: 0.85em;
+  font-family: var(--font-data);
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.badge--critical {
+  color: var(--severity-critical);
+  background: var(--severity-critical-bg);
+  border-color: var(--severity-critical);
+}
+
+.badge--warning {
+  color: var(--severity-warning);
+  background: var(--severity-warning-bg);
+  border-color: var(--severity-warning);
+}
+
+.badge--derived {
+  color: var(--severity-derived);
+  background: var(--severity-derived-bg);
+  border-color: var(--border-strong);
+}
+
+.badge--ok {
+  color: var(--severity-ok);
+}
+
+button.link-button {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+button.link-button:hover {
+  color: var(--text);
+}
+
+/* ---- layout shell ---- */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.app__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+
+.app__title {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+  color: var(--text-dim);
+  margin: 0;
+}
+
+.app__main {
+  flex: 1;
+  overflow: auto;
+  padding: 20px;
+}
+
+/* ---- nav ---- */
+
+.nav {
+  display: flex;
+  gap: 2px;
+  padding: 0 20px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.nav__item {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+  padding: 10px 14px;
+  cursor: pointer;
+}
+
+.nav__item:hover {
+  color: var(--text);
+}
+
+.nav__item--active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+/* ---- time range picker ---- */
+
+.time-range-picker {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.time-range-picker__preset {
+  background: var(--bg-panel-raised);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: var(--radius);
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: 0.85em;
+}
+
+.time-range-picker__preset:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.time-range-picker__custom {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+}
+
+.time-range-picker__custom input {
+  background: var(--bg-panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 3px 6px;
+  color-scheme: dark;
+}
+
+/* ---- state views ---- */
+
+.state-view {
+  padding: 40px 20px;
+  text-align: center;
+}
+
+.state-view__title {
+  font-size: 15px;
+}
+
+.state-view__hint {
+  max-width: 520px;
+  margin: 8px auto 0;
+  font-size: 0.9em;
+}
+
+.state-view--error .state-view__title {
+  color: var(--severity-warning);
+}
+
+/* ---- topology view ---- */
+
+.topology-view__graph {
+  width: 100%;
+  max-width: 100%;
+  overflow: visible;
+}
+
+.topology-node {
+  cursor: pointer;
+}
+
+.topology-view__note {
+  margin-top: 12px;
+  font-size: 0.85em;
+  max-width: 640px;
+}
+
+/* ---- flame graph ---- */
+
+.trace-view__header {
+  margin-bottom: 12px;
+}
+
+.flame-graph {
+  position: relative;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  overflow-x: auto;
+}
+
+.flame-bar {
+  position: absolute;
+  height: 24px;
+  min-width: 2px;
+  background: var(--bg-panel-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+  display: flex;
+  align-items: center;
+  padding: 0 4px;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 11px;
+  cursor: default;
+}
+
+.flame-bar--orphan {
+  border-style: dashed;
+  border-color: var(--severity-warning);
+  background: var(--severity-warning-bg);
+}
+
+.flame-bar--approximate {
+  border-color: var(--accent);
+}
+
+.flame-bar--error {
+  border-color: var(--severity-critical);
+}
+
+.flame-bar__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.flame-bar__orphan-badge {
+  padding: 0 3px;
+  font-size: 9px;
+  flex-shrink: 0;
+}
+
+.flame-bar__expand {
+  margin-left: 4px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  color: var(--accent);
+  border-radius: 2px;
+  font-size: 10px;
+  cursor: pointer;
+  padding: 0 4px;
+  flex-shrink: 0;
+}
+
+.trace-view__detail {
+  margin-top: 12px;
+  padding: 10px 12px;
+}
+
+.trace-view__detail-row {
+  margin: 2px 0;
+}
+
+/* ---- incidents view ---- */
+
+.incidents-view__filter {
+  margin-bottom: 10px;
+}
+
+.incidents-view__table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.incidents-view__table th {
+  text-align: left;
+  font-weight: 400;
+  font-size: 0.8em;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.incidents-view__table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.incidents-view__row {
+  cursor: pointer;
+}
+
+.incidents-view__row:hover {
+  background: var(--bg-panel-raised);
+}
+
+.incidents-view__row--derived {
+  color: var(--text-dim);
+}
+
+.incidents-view__expanded td {
+  background: var(--bg);
+  padding: 10px 20px;
+}
+
+.incidents-view__example-traces {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.incidents-view__example-traces li {
+  padding: 2px 0;
+  font-size: 0.9em;
+}

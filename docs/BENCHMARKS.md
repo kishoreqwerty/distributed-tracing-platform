@@ -496,7 +496,28 @@ offered there.
 
 ## Phase 4 — Dashboard
 
-- Query latency for common dashboard views:
+**Single-request API latency**, measured with `curl -w "%{time_total}"`
+against the live compose stack's real accumulated data (not a load
+test — this project's load characterization is Phase 6, unbuilt; these
+are one client, one request at a time, wall-clock end to end):
+
+| Endpoint | Latency |
+|---|---|
+| `GET /api/traces` (limit=20) | 0.063-0.080s (3 runs) |
+| `GET /api/traces/{trace_id}` | 0.016s |
+| `GET /api/topology` | 0.004s |
+| `GET /api/detections` | 0.008s |
+| `GET /api/clock-offsets` | 0.005s |
+
+`/api/traces` is the outlier — it's the one endpoint whose SQL applies a
+Python-side filter after fetching a candidate set
+(`min_duration_ms`; see `docs/DECISIONS.md`), rather than filtering
+entirely inside ClickHouse. The other four are near-instant single
+aggregation queries against this project's current (modest) data
+volume; none of these numbers say anything about behavior under
+concurrent dashboard load or a much larger table — that's exactly what
+Phase 6 exists to measure, not something this phase invents a number
+for.
 
 ## Phase 5 — TBD
 

@@ -1,6 +1,6 @@
 # Architecture
 
-## Components (Phase 4, partial: query API only — dashboard not yet built)
+## Components
 
 ```mermaid
 flowchart LR
@@ -13,7 +13,7 @@ flowchart LR
     api["analyzer-api (Python)\nread-only FastAPI query layer\nsame package as analyzer,\nseparate process"]
     prometheus["Prometheus"]
     grafana["Grafana"]
-    dashboard["dashboard (React/TS)\n[empty scaffold]"]
+    dashboard["dashboard (React/TS)\ntopology + trace + incidents views"]
 
     loadgen -- "OTLP/gRPC (faulted spans)" --> collector
     loadgen -- "ground truth (pre-fault,\nincluding incidents)" --> clickhouse
@@ -29,12 +29,12 @@ flowchart LR
     prometheus -- "scrape /metrics" --> writer
     prometheus -- "scrape /metrics" --> analyzer
     grafana -- "query" --> prometheus
-    dashboard -. "later phase" .-> api
+    dashboard -- "GET /api/* (polled)" --> api
 ```
 
-Dotted edges are not implemented yet — only `dashboard` remains one, as an
-empty scaffold; `api` (deliverable 1 of Phase 4) is built and live, just
-not yet consumed by anything. `analyzer` does everything this project's
+No dotted edges remain — `dashboard` is now a real client of `api`, not a
+placeholder; see "Dashboard" below for what it actually renders.
+`analyzer` does everything this project's
 core measurement loop needs: trace reassembly, service topology
 aggregation, clock skew detection, rolling baselines, anomaly detection,
 alert suppression, and (`eval.py`) comparing its own reconstruction and
@@ -83,6 +83,75 @@ or a thread inside the main analyzer loop.
   range, derived/root-cause resolved where the root is in the same
   page), `GET /api/clock-offsets` (per-service offset + confidence,
   highest-confidence reading per service in range).
+
+## Dashboard
+
+`dashboard/` — a React/TypeScript single-page app (Vite build, no
+router, no charting/graph library, no flame-graph library — SVG and DOM
+rendered by hand) that is a pure client of the query API above and
+writes nothing anywhere. Deliberately minimal dependencies: this phase
+is about displaying what Phases 1-3 already compute, not adding new
+detection or reconstruction logic — see `docs/DECISIONS.md`.
+
+Three views, switched by a top-level tab (`src/components/Nav.tsx`), all
+scoped to a shared time range picker:
+
+- **Topology** (`src/views/TopologyView.tsx`) — service nodes and edges
+  from `GET /api/topology`, laid out by a deterministic depth-layered
+  algorithm (`src/lib/topologyLayout.ts`: BFS depth from the structural
+  root, alphabetical ordering within a depth) rather than a force-directed
+  simulation, specifically so the same topology renders in the same
+  positions across refreshes instead of visibly drifting. Edge width is
+  a log scale of call volume; edge color is an error-rate gradient. Each
+  node shows its clock offset from `GET /api/clock-offsets`, rendered as
+  "unknown" below `CLOCK_OFFSET_CONFIDENCE_THRESHOLD`
+  (`src/lib/clockOffset.ts`) rather than a number the estimator doesn't
+  actually support at that confidence — see `docs/BENCHMARKS.md`'s
+  13-51ms noise floor for why that threshold exists at all. A service
+  with an active incident (from `GET /api/detections`) is marked
+  directly on its node; clicking a node filters the Incidents view to
+  that service.
+- **Trace** (`src/views/TraceView.tsx`) — a flame graph for one trace
+  from `GET /api/traces/{trace_id}`, built by `src/lib/flameGraph.ts`
+  seeding depth from both true roots *and* orphans (mirroring
+  `reassembly.py`'s own reachability seeding — see `docs/DECISIONS.md`),
+  so an orphan subtree gets a well-defined local depth instead of being
+  silently reparented under something it was never actually a child of.
+  Orphan spans carry a persistent "orphan" badge naming the real,
+  unresolved `parent_span_id`, not just a hover tooltip — a viewer
+  scanning the graph needs to see it without hovering every bar. Spans
+  from a service below the clock-offset confidence threshold, or with a
+  non-trivial resolved offset, are marked with an approximate-position
+  indicator rather than rendered as if their timing were exact. Large
+  traces are handled by depth-capping
+  (`src/lib/flameGraphLayout.ts`: `MAX_DEPTH = 8`) with per-node
+  one-level-at-a-time expansion and a hard `MAX_RENDERED_NODES = 500`
+  backstop, chosen over viewport virtualization or canvas rendering — see
+  `docs/DECISIONS.md`.
+- **Incidents** (`src/views/IncidentsView.tsx`) — grouped incidents from
+  `GET /api/detections`, not raw per-window detections. A `derived`
+  incident (suppression's propagated-echo call — see "Alert suppression"
+  above) is visually dimmed and links to its resolved root cause when
+  the root incident is in the same page's results, or says so plainly
+  ("root not in range") when it isn't — never silently drops the link.
+  Clicking a row filters the Topology view to that incident's service
+  and expands a row-level fetch of example traces
+  (`GET /api/traces`, scoped to the incident's window and target)
+  clickable straight into the Trace view. The empty state is
+  deliberately non-committal: an empty incident list can't distinguish
+  "the system was healthy" from "baselines are still warming up"
+  without new backend detection logic this phase doesn't add, so the
+  copy says exactly that instead of implying health.
+
+`src/hooks/useApiQuery.ts` is the one piece of shared plumbing: fetch on
+mount/deps-change, optional fixed-interval polling that never clobbers
+known-good data with a transient poll failure, and an `enabled` guard so
+a view with nothing to fetch yet (e.g. Trace with no trace selected)
+doesn't fire a request with a garbage argument before its own early
+return runs — see `docs/ISSUES.md`. `src/lib/` holds every pure,
+independently-tested computation (layout, flame graph construction,
+visibility/expansion, clock-offset formatting); `src/views/` and
+`src/hooks/` are the only places that touch the network or React state.
 
 ## Data flow — span lifecycle from emit to query
 
@@ -441,7 +510,7 @@ numbers and `integration/pipeline_test.go`'s
                        read-only query API (api/, runs as its own container)
 /integration         Go — compose-based integration tests (build tag: integration)
 /scripts             run_sweep.sh (Phase 2 fault sweep), run_incident_sweep.sh (Phase 3 incident sweep)
-/dashboard           React/TS (empty scaffold)
+/dashboard           React/TS — topology graph, trace flame graph, incidents list; client of api/
 /deploy              docker-compose.yml (+ docker-compose.eval.yml overlay), ClickHouse init SQL, Prometheus/Grafana config
 /docs                this file, DECISIONS.md, ISSUES.md, BENCHMARKS.md
 ```
@@ -462,6 +531,19 @@ wired in as a datasource. Prometheus targets page is at
 `http://localhost:8000` — e.g.
 `curl 'http://localhost:8000/api/topology?start=2026-01-01T00:00:00Z&end=2026-01-01T01:00:00Z'`
 (every endpoint requires `start`/`end`; see "Query API" above).
+
+```sh
+cd dashboard
+npm install
+npm run dev
+```
+
+Serves the dashboard at `http://localhost:5173`, pointed at
+`http://localhost:8000` by default (override with `VITE_API_BASE_URL`).
+Needs the compose stack (above) already running for the API calls to
+resolve to anything. `npm run build` produces a static production
+bundle; `npm test` runs the component/unit test suite
+(vitest + @testing-library/react).
 
 ```sh
 cd loadgen

@@ -10,7 +10,7 @@ straightforward read of tables Phases 1-3 already populate.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from clickhouse_connect.driver.client import Client
 
@@ -44,9 +44,17 @@ class SpanRow:
 
 
 @dataclass(frozen=True)
+class TraceClockOffset:
+    service_name: str
+    offset_ns: int
+    confidence: int
+
+
+@dataclass(frozen=True)
 class TraceDetail:
     trace_id: str
     spans: list[SpanRow]
+    clock_offsets: list[TraceClockOffset]
 
 
 @dataclass(frozen=True)
@@ -96,19 +104,23 @@ def fetch_traces(
     limit: int,
     offset: int,
     candidate_cap: int,
-) -> tuple[list[TraceSummaryRow], bool]:
-    """Trace listing. `trace_summaries` doesn't store trace duration (see
-    docs/DECISIONS.md — it wasn't needed until this endpoint), so
-    duration is fetched separately for a *candidate* set — at most
-    `candidate_cap` time/service/completeness-matched trace_summaries
-    rows — and `min_duration_ms` filtering happens in Python over that
-    set, not in SQL over the full match. If more than `candidate_cap`
-    traces match the time/service/completeness filters within the
-    requested range, some real matches past that cap are never
-    considered for duration filtering or pagination at all. This is the
-    documented compromise, not a bug: computing duration for an unbounded
-    candidate set would mean an unbounded `spans` scan, which is exactly
-    what this API isn't allowed to do.
+) -> tuple[list[TraceSummaryRow], bool, bool]:
+    """Trace listing. Returns (page, has_more, duration_filter_truncated).
+
+    `trace_summaries` doesn't store trace duration (see docs/DECISIONS.md
+    — it wasn't needed until this endpoint), so duration is fetched
+    separately for a *candidate* set — at most `candidate_cap` time/
+    service/completeness-matched trace_summaries rows — and
+    `min_duration_ms` filtering happens in Python over that set, not in
+    SQL over the full match. If the candidate fetch comes back exactly at
+    `candidate_cap`, there may be real matches beyond it that were never
+    considered for duration filtering at all —
+    `duration_filter_truncated` is True exactly in that case (and only
+    ever considered when `min_duration_ms` was actually requested; a
+    plain listing's own pagination is handled honestly by `has_more`
+    regardless). Silently dropping those matches would contradict this
+    project's whole stance on reporting uncertainty rather than hiding
+    it — the caller must be told, not just the docstring.
     """
     conditions = ["window_start >= %(start)s", "window_start <= %(end)s"]
     params: dict[str, object] = {"start": start, "end": end, "cap": candidate_cap}
@@ -149,12 +161,14 @@ def fetch_traces(
         c if c.trace_id not in durations else _with_duration(c, durations[c.trace_id]) for c in candidates
     ]
 
+    duration_filter_truncated = False
     if min_duration_ms is not None:
+        duration_filter_truncated = len(candidates) >= candidate_cap
         with_duration = [c for c in with_duration if (c.duration_ms or 0.0) >= min_duration_ms]
 
     page = with_duration[offset : offset + limit]
     has_more = len(with_duration) > offset + limit
-    return page, has_more
+    return page, has_more, duration_filter_truncated
 
 
 def _with_duration(row: TraceSummaryRow, duration_ms: float) -> TraceSummaryRow:
@@ -221,7 +235,49 @@ def fetch_trace_detail(client: Client, database: str, trace_id: str) -> TraceDet
             span_result.result_rows
         )
     ]
-    return TraceDetail(trace_id=trace_id, spans=spans)
+
+    trace_start = datetime.fromtimestamp(min(s.start_time_unix_nano for s in spans) / 1e9, tz=timezone.utc)
+    services = sorted({s.service_name for s in spans})
+    clock_offsets = _fetch_clock_offsets_for_services(client, database, services, trace_start)
+
+    return TraceDetail(trace_id=trace_id, spans=spans, clock_offsets=clock_offsets)
+
+
+def _fetch_clock_offsets_for_services(
+    client: Client, database: str, services: list[str], at: datetime
+) -> list[TraceClockOffset]:
+    """The clock-offset context a flame graph needs to mark a span's
+    position as approximate: each service's most recent offset estimate
+    at or before the trace's own start — resolved here, once, rather than
+    pushed onto the frontend as a second request against
+    /api/clock-offsets. A trace spans milliseconds; clock offset windows
+    are tens of seconds to minutes — the frontend would otherwise have to
+    correctly guess how wide a range to query around a single trace's
+    narrow timestamp, for every trace it renders. See docs/DECISIONS.md.
+
+    A service with no offset estimate at all (never appeared in an
+    analyzer window's resolved pairs, or too early for one to exist yet)
+    is simply absent from the result — the same "absence is not zero"
+    reasoning used everywhere else in this project. The frontend reads
+    absence as "no estimate available," same as it would read a present
+    but low-confidence one as "not sufficient" — neither is this
+    function's call to make.
+    """
+    if not services:
+        return []
+    query = f"""
+        SELECT service_name,
+               argMax(offset_ns, window_start) AS offset_ns,
+               argMax(confidence, window_start) AS confidence
+        FROM {database}.service_clock_offsets FINAL
+        WHERE service_name IN %(services)s AND window_start <= %(at)s
+        GROUP BY service_name
+    """
+    result = client.query(query, parameters={"services": services, "at": at})
+    return [
+        TraceClockOffset(service_name=service_name, offset_ns=offset_ns, confidence=confidence)
+        for service_name, offset_ns, confidence in result.result_rows
+    ]
 
 
 def fetch_topology(

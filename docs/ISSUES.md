@@ -635,3 +635,79 @@ see docs/BENCHMARKS.md for the full distribution and why a mean close to
 half the 20s window width is exactly what this measurement should
 produce given incidents start at an essentially random offset within
 their first window.
+
+## Phase 4 (deliverables 2-7: dashboard)
+
+### Flame graph hid every orphan span, including its own well-formed descendants
+
+**Symptom:** `visibleFlameNodes` returned zero rows for any span
+classified `orphan_missing_parent`, and — worse — hid that orphan's own
+children too, even when the trace was well under `MAX_DEPTH`. Caught by
+a failing component test (`TraceView.test.tsx`'s orphan-rendering case),
+not live: this environment has no browser, so the frontend's correctness
+depended entirely on the test suite catching exactly this kind of thing.
+
+**Root cause:** the visibility check treated an orphan's own
+`parent_span_id` the same as any other node's: `parentVisible =
+parentId === "" || visibleSpanIds.has(parentId)`. An orphan's
+`parent_span_id` is neither empty nor ever going to appear in
+`visibleSpanIds`, by definition — it's the exact ID reassembly already
+proved doesn't resolve in this trace — so every orphan read as "my
+ancestor got cut off by the depth cap," which is a real state a normal
+deep node can be in, but not what was actually true here. Their
+children then inherited the same false verdict transitively.
+
+**Fix:** `src/lib/flameGraph.ts`'s `buildFlameNodes` seeds depth-0 from
+both true roots *and* orphans (mirroring `reassembly.py`'s own
+reachability seeding, so an orphan subtree gets a well-defined local
+depth instead of being silently reparented under something it was never
+a child of). `visibleFlameNodes`'s check became `n.depth === 0 ||
+visibleSpanIds.has(parentId)` — depth 0 is always visible regardless of
+what garbage sits in `parent_span_id`, correctly distinguishing "this is
+a seed with no real ancestor" from "my real ancestor exists but got cut
+by the depth cap."
+
+### `useApiQuery` fired a request with a garbage argument before its caller's own early return could stop it
+
+**Symptom:** a React `act()` warning in `TraceView`'s test suite —
+state updating after the test had already finished asserting. Traced to
+`fetchTraceDetail(undefined!)` actually being called and its promise
+resolving (or rejecting) well after the component that "had nothing to
+fetch yet" had already rendered its empty state and moved on.
+
+**Root cause:** a hook's own `useEffect` runs on every render regardless
+of what the calling component does afterward — `TraceView`'s `if
+(!traceId) return <EmptyState ... />` came *after* the
+`useApiQuery(() => fetchTraceDetail(traceId!), ...)` call in source
+order, but React doesn't skip a hook's effect just because a later
+`return` in the same render would have made calling it pointless. Every
+render with no trace selected still fired a real network call with a
+non-null-asserted `undefined` as the trace ID.
+
+**Fix:** added an `enabled` parameter to `useApiQuery`
+(`src/hooks/useApiQuery.ts`) that skips the fetch (and the poll)
+entirely when `false`, called from `TraceView` as `useApiQuery(() =>
+fetchTraceDetail(traceId!), [traceId], undefined, traceId !==
+undefined)`. Any future view whose fetch depends on optional
+props/state needs to pass its own `enabled` condition rather than
+relying on an early return to prevent the fetch — the two are not
+equivalent.
+
+### Orphan indicator was only reachable by hovering, contradicting the deliverable's own "visually distinct" requirement
+
+**Observation, not a crash — a design gap caught by rereading the
+deliverable spec against the actual component, not by a test.** The
+first working version of the flame graph rendered an orphan's
+classification badge only inside the hover-triggered detail panel
+(`classificationBadge()`), the same treatment every other classification
+gets. That's a real regression from the deliverable's requirement that
+orphan spans be rendered "explicitly," identifiable without hovering
+every single bar in a trace that might have hundreds.
+
+**Fix:** added a second, persistent badge directly in
+`.flame-bar__label` (`TraceView.tsx`), rendered whenever
+`node.isOrphan`, carrying the same real unresolved `parent_span_id` in
+its `title`. The hover panel's badge stays as-is for the other
+classifications (`cycle_rejected`, unclassified); orphan is now visible
+both ways, persistent and on hover, since the persistent one is the one
+that actually matters for the "distinct at a glance" requirement.
