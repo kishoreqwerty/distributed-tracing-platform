@@ -345,6 +345,29 @@ firing on exactly the windows the incident was active, with `call_rate`
 detections for other, genuinely-affected targets in the same windows
 surviving alongside it rather than colliding.
 
+**The general lesson, not just this table's fix:** a `ReplacingMergeTree`
+`ORDER BY` is a dedup key, and every dimension the application writes
+*independently* — every axis where two different, simultaneously-true
+rows can legitimately exist — has to be in it, or ClickHouse will
+silently treat those independent facts as competing versions of one
+fact and keep only one, with no error, no warning, and no signal at the
+application layer that anything was lost. This project has now built
+five `ReplacingMergeTree` tables across two phases (`trace_summaries`,
+`span_classifications`, `service_edges`, `service_clock_offsets`, now
+`detections`), and every one of the first four happened to have an
+`ORDER BY` that was already a true 1:1 key for what gets written each
+window — one summary per trace, one classification per span, one
+offset per service, one row per edge — so this class of bug simply
+never had a chance to occur until `detections` introduced the first
+table where a single "thing" (a target, in a window) can legitimately
+produce *more than one* independently-true row (one per detector). The
+schema comment for `detections` now says this explicitly; any future
+`ReplacingMergeTree` table should get the same question asked of it
+before its `ORDER BY` is written, not after a query silently comes back
+short: *for a fixed value of every column in this key, is there ever
+more than one row this application would legitimately want to write at
+once?* If yes, something is still missing from the key.
+
 ### `latency_spike` on a non-leaf service can be substantially diluted by its own children's duration
 
 **Observation, not a bug — a real, non-obvious property of the incident
@@ -409,3 +432,206 @@ false-positive count. Flagging this now, before that harness gets built,
 rather than discovering it after a sweep's false-positive numbers turn
 out to be dominated by an artifact of the harness rather than the
 detector.
+
+## Phase 3 (deliverables 4-5: alert suppression, accuracy eval)
+
+Three real bugs were found analyzing the deliverable-5 incident sweep's
+own results, after all 22 points had already run. None of them required
+re-running the sweep to fix — every fix only changed how `eval.py`
+computes a metric from data already durably sitting in ClickHouse, so
+each was verified by re-running `python -m analyzer.eval <run_id>
+--json` against the existing 22 run_ids, not by regenerating traffic.
+`scripts/incident_sweep_results.jsonl` was regenerated from scratch after
+all three fixes landed — every number in docs/BENCHMARKS.md's Phase 3
+section comes from that final regeneration, not from any earlier,
+partially-fixed pass. Reported here in the order they were found, since
+each one was uncovered while investigating the previous one's numbers.
+
+### The general lesson from Phase 3's `ReplacingMergeTree` bug, restated plainly
+
+Deliverables 1-3's writeup already covers the specific fix (`detections`'
+`ORDER BY` needed `detector` added to it — see that section above). The
+rule worth stating on its own, independent of that one table: **a
+`ReplacingMergeTree` `ORDER BY` is a dedup key, and it must include every
+dimension the application can legitimately write independently of the
+others — every axis where two different, simultaneously-true rows can
+exist for the same target and the same window. If it doesn't, ClickHouse
+merges them into "the same row" silently: no error, no warning, no
+application-level signal that anything was lost.** The question to ask of
+any `ReplacingMergeTree` table, before or after writing its `ORDER BY`,
+is: *for a fixed value of every column in this key, is there ever more
+than one row this application would legitimately want to write at once?*
+`detections` is the one table in this schema that failed that question
+(a target can trip more than one detector in the same window); the other
+four `ReplacingMergeTree` tables built across Phases 2-3
+(`trace_summaries`, `span_classifications`, `service_edges`,
+`service_clock_offsets`, `service_stats`, `service_baselines`,
+`edge_baselines`, `detected_incidents`) were each audited against this
+question directly while writing this section and don't have the same
+gap — each one's key is a genuine 1:1 identity for what gets written
+each cycle. Worth being precise about this rather than overclaiming a
+second literal instance of the same bug: the *other* two bugs found this
+phase (below) are a related but structurally different mistake — not a
+merge-key collision, but a query silently reaching backward past a
+legitimately-absent row instead of treating that absence as the real
+zero it is. Same underlying category of error (failing to reckon with
+what ClickHouse's "no row" actually means), different mechanism, in a
+different layer of the code (application query logic, not schema
+design) — see below.
+
+### `eval.py`'s incident precision was measured over the whole run, including the gap between sweep points, not just the incident's own active window
+
+**Symptom:** re-evaluating the sweep's own results well after the run
+that produced them (rather than immediately, the way `run_incident_sweep.sh`
+does automatically) showed precision numbers that looked implausibly bad
+and, worse, kept changing the more time passed since the sweep finished.
+A single, cleanly-detected `latency_spike` on a leaf service
+(`notifications`, magnitude 8 — as unambiguous a detection as this sweep
+produced) reported precision as low as 0.083 (1 real detection against
+12 "found") on one evaluation pass and different numbers again on a
+later pass against the identical underlying data.
+
+**Root cause:** `IncidentEvalResult.found_incident_count` counted every
+non-derived analyzer incident anywhere in the run's *entire* evaluated
+time range (`[lo - 30s, hi + 30s]`, `lo`/`hi` being the run's own first
+and last generated span) — not restricted to the true incident's own
+`[start_time, end_time]` window. A sweep run spends most of its several
+minutes outside the incident: a 60-second lead-in before the incident
+starts, a recovery tail after it ends, and — because
+`run_incident_sweep.sh` launches the next point's loadgen process
+immediately after this one's post-wait sleep, not with zero gap — a real
+~60-70 second silence between this run's own traffic ending and the next
+point's traffic beginning. That gap reproduces the exact
+process-boundary `call_rate` artifact already documented above (loadgen
+starting/stopping produces a real, if spurious, drop in call rate), just
+once per point-transition instead of once per short discrete run. Those
+boundary detections don't land inside this run's own `[lo, hi]`, but
+they do land inside the widened `[lo-30s, hi+30s]` evaluation margin, and
+critically: **how many of them have finished being written by the time
+`eval.py` runs depends on how much wall-clock time has passed**, since a
+detection needs its window to close, clear the watermark, and get
+polled before it exists in ClickHouse at all. Evaluating right after the
+post-wait catches some of that tail; evaluating minutes later catches
+more of it. That's a run that produces a *different* precision number
+depending on when you happen to score it — not stale data, but a
+metric that was never well-defined in the first place.
+
+**Fix:** `found_incident_count` (and therefore precision) is now scoped
+to non-derived analyzer incidents that overlap *some* true incident's own
+window, when the run has true incidents at all — not the whole evaluated
+range. A healthy-control run (no true incidents to restrict to) still
+correctly uses the whole range, since the whole run *is* what's being
+measured for false positives there.
+
+**Before/after, aggregated across all 21 non-control sweep points** (sum
+of `found_incident_count` and `true_positive_count` across every
+incident-type point, computed both ways against the identical final
+dataset):
+
+| | found (sum) | true positive (sum) | aggregate precision |
+|---|---|---|---|
+| Before (whole-run scoping) | 96 | 18 | 0.188 |
+| After (incident-window scoping) | 44 | 18 | 0.409 |
+
+Detection outcomes themselves (`true_positive_count`, `recall`) are
+unchanged by this fix — only what counts as a false positive changed.
+The clearest single illustration: `latency_spike` on `checkout` at
+magnitude 2 or 4 (both genuinely undetected — see docs/BENCHMARKS.md's
+dilution discussion) went from `found=3` (three stray, unrelated
+boundary detections, all outside the incident's own window, none
+actually about this incident) to `found=0` — correctly reporting
+"nothing was found, real or spurious" for a case where nothing should
+have been.
+
+**This is directly upstream of the phase's healthy-control false-positive
+number in mechanism, not in this specific fix.** The healthy-control run
+has no true-incident window to restrict to, so its own `found`/
+`total_detection_count`/`healthy_control_detections_per_hour` were not
+changed by this fix and still use the full `[lo-30s, hi+30s]` range — but
+that range is subject to the exact same gap-bleed mechanism described
+above, and direct inspection confirmed it: the healthy-control run's own
+47 raw detections cluster into two groups, a small one at the run's own
+start (~15:07:00) and a much larger one from ~15:09:40 to ~15:11:00 —
+past the run's actual end (15:10:17) and reaching into the gap before the
+*next* sweep point's traffic resumed. Restricting strictly to the run's
+own `[lo, hi]` with no margin at all drops the raw count from 47 to 14.
+The reported healthy-control rate (docs/BENCHMARKS.md) should be read as
+"per-run false positive rate including this harness's own inter-point
+silence," not a pure measurement of a continuously-running system with no
+process boundary at all — see docs/BENCHMARKS.md for the full discussion
+of both numbers.
+
+### `eval.py`'s observed-magnitude calculation silently read stale pre-incident data instead of a genuine zero
+
+**Symptom:** three `edge_disappearance` sweep points, run back to back with
+identical configuration (same edge, same magnitude, same duration),
+reported wildly different observed magnitudes: 0.047, 0.936, 0.828 — for
+a fault that forces call probability to exactly 0 and should read ~1.0
+(complete traffic loss) every time.
+
+**Root cause:** `_fetch_stat_at_or_before` looked up a target's current
+call count via `ORDER BY window_start DESC LIMIT 1` with no lower bound —
+"whatever the most recent row is, however far back." But
+`topology_agg`/`service_agg` only ever write a row for a window that had
+at least one call (a deliberate Phase 2 design choice — see
+docs/DECISIONS.md's "absence of data is not zero" reasoning): a window
+with *genuinely* zero traffic produces no row at all, not a row with
+`call_count=0`. During an active `edge_disappearance` incident, every
+window has zero calls on that edge and therefore no row — so the
+unbounded backward search walked straight past the entire incident and
+returned whatever pre-incident window last had real traffic, making a
+complete outage look like it hadn't happened. Which of the three runs
+looked "more correct" than the others came down to how close a stray,
+mostly-empty boundary window (residual traffic in the second or two right
+at the incident's edge) happened to be to the query's search point —
+pure timing luck, not a real difference in behavior between three
+identically-configured runs.
+
+**Fix:** bounded the search to `window_seconds` (passed in from
+`ANALYZER_WINDOW_SECONDS`, threaded through `evaluate()` and the sweep
+script's eval invocation) and return an explicit `(0, 0, 0.0)` — a real,
+meaningful zero — when nothing is found within that bound, rather than
+reaching further back. This is the exact same "absence of data is a real
+zero, not missing data" reasoning `detect_call_rate_drop` already applies
+live (see deliverables 1-3's writeup) — the bug was that `eval.py`'s
+own, separately-written offline query never got that reasoning applied
+to it in the first place.
+
+**Before/after, the three `edge_disappearance` runs' observed magnitude:**
+0.047, 0.936, 0.828 → 1.0, 1.0, 1.0 (all three, exactly).
+
+### `eval.py`'s detection latency was measured against the wrong reference point, silently reading as ~0s regardless of true detection speed
+
+**Symptom:** found while sanity-checking the sweep's own numbers before
+writing them up (not from a live symptom) — 21 of 22 points reported
+detection latency of exactly `0.0` seconds, and the one exception
+happened to be an otherwise-unremarkable point. A near-universal ~0s
+result across every incident type and magnitude was implausible on its
+face: it would mean detection is instantaneous regardless of window
+size, traffic pattern, or fault type, which nothing about this design
+supports.
+
+**Root cause:** latency was computed as `first_matching_window.start_window
+- true_incident.start_time`, clamped at 0. But an analyzer incident only
+needs to *overlap* the true incident's window to count as a match — and
+because analyzer windows are epoch-aligned, not aligned to when an
+incident happens to start, the first overlapping window's start almost
+always falls *before* the incident's true onset (the incident begins
+somewhere in the middle of a window that was already ticking), making the
+raw subtraction negative and the `max(0, ...)` floor silently absorb it
+into a meaningless zero on nearly every measurement.
+
+**Fix:** measure from the incident's true onset to when the first window
+containing enough in-incident data actually *closes* — `(first_matching_window.start_window
++ window_seconds) - true_incident.start_time`, still clamped at 0. Not a
+perfect measurement (it doesn't include watermark/poll pipeline delay,
+which is a separate, already-measured concern — see docs/BENCHMARKS.md's
+Phase 1/2 windowing sections), but it no longer manufactures a false
+"instant detection" result by construction.
+
+**Before/after:** 21 of 22 points at exactly `0.0`s → a real distribution
+ranging 0.8s-22.1s (mean 12.0s, median 12.2s, n=18 detected incidents) —
+see docs/BENCHMARKS.md for the full distribution and why a mean close to
+half the 20s window width is exactly what this measurement should
+produce given incidents start at an essentially random offset within
+their first window.

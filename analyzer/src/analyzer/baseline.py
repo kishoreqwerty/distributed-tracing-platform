@@ -50,42 +50,13 @@ for the freeze-vs-longer-lookback tradeoff.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
 
 from analyzer import reader
 from analyzer.reassembly import SpanRow, resolved_parent_child_pairs
 from analyzer.statutil import mad, median
+from analyzer.targets import Baseline, TargetKey
 
 _ERROR_STATUS_CODE = 2  # OTLP Status.StatusCode.STATUS_CODE_ERROR
-
-
-@dataclass(frozen=True)
-class TargetKey:
-    """Identifies one detection target. kind is "service" or "edge";
-    caller is "" for a service target, the calling service for an edge
-    target. callee is the service itself for a service target, or the
-    edge's callee for an edge target.
-    """
-
-    kind: str
-    caller: str
-    callee: str
-
-    def label(self) -> str:
-        return self.callee if self.kind == "service" else f"{self.caller}->{self.callee}"
-
-
-@dataclass(frozen=True)
-class Baseline:
-    target: TargetKey
-    call_count_observed: int
-    latency_median_ms: float
-    latency_mad_ms: float
-    error_rate: float
-    call_rate_median: float
-    call_rate_mad: float
-    window_count_observed: int
-    ready: bool
 
 
 def compute_baseline(

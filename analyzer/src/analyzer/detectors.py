@@ -44,7 +44,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from analyzer.baseline import Baseline, TargetKey
+from analyzer.targets import Baseline, TargetKey
 
 # Standard "modified z-score" scale factor: MAD is multiplied by this to
 # put it on the same scale as a normal distribution's standard deviation,

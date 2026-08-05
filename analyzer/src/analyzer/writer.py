@@ -9,11 +9,12 @@ from datetime import datetime, timezone
 
 from clickhouse_connect.driver.client import Client
 
-from analyzer.baseline import Baseline
 from analyzer.clockskew import ServiceOffset
 from analyzer.detectors import Detection
 from analyzer.reassembly import ReassemblyResult
 from analyzer.service_agg import ServiceStats
+from analyzer.suppression import GroupedIncident
+from analyzer.targets import Baseline
 from analyzer.topology_agg import ServiceEdge
 
 
@@ -233,6 +234,43 @@ def write_detections(client: Client, database: str, detections: list[Detection])
             "observed_value",
             "baseline_value",
             "deviation",
+        ],
+    )
+
+
+def write_detected_incidents(client: Client, database: str, incidents: list[GroupedIncident]) -> None:
+    if not incidents:
+        return
+    client.insert(
+        f"{database}.detected_incidents",
+        [
+            [
+                i.incident_id,
+                i.target.kind,
+                i.target.label(),
+                i.detector,
+                _to_datetime(i.start_window),
+                _to_datetime(i.end_window),
+                i.window_count,
+                i.peak_severity,
+                i.peak_deviation,
+                1 if i.derived else 0,
+                i.root_cause_incident_id,
+            ]
+            for i in incidents
+        ],
+        column_names=[
+            "incident_id",
+            "target_type",
+            "target",
+            "detector",
+            "start_window",
+            "end_window",
+            "window_count",
+            "peak_severity",
+            "peak_deviation",
+            "derived",
+            "root_cause_incident_id",
         ],
     )
 

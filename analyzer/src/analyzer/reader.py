@@ -18,12 +18,14 @@ double-counted as two different spans.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from clickhouse_connect.driver.client import Client
 
 from analyzer.chclient import decode_fixed_string
+from analyzer.detectors import Detection
 from analyzer.reassembly import SpanRow
+from analyzer.targets import TargetKey
 
 _WINDOW_QUERY = """
 SELECT trace_id, span_id, parent_span_id, service_name,
@@ -57,6 +59,17 @@ SELECT call_count FROM {database}.service_edges FINAL
 WHERE caller_service = %(caller)s AND callee_service = %(callee)s
   AND window_start >= fromUnixTimestamp64Nano(toInt64(%(start)s * 1e9))
   AND window_start <  fromUnixTimestamp64Nano(toInt64(%(end)s * 1e9))
+"""
+
+_RECENT_DETECTIONS_QUERY = """
+SELECT window_start, target_type, target, detector, severity, observed_value, baseline_value, deviation
+FROM {database}.detections FINAL
+WHERE window_start >= fromUnixTimestamp64Nano(toInt64(%(start)s * 1e9))
+  AND window_start <= fromUnixTimestamp64Nano(toInt64(%(end)s * 1e9))
+"""
+
+_TOPOLOGY_EDGES_QUERY = """
+SELECT DISTINCT caller_service, callee_service FROM {database}.service_edges
 """
 
 
@@ -112,6 +125,54 @@ def fetch_edge_call_count_history(
         parameters={"caller": caller, "callee": callee, "start": start, "end": end},
     )
     return [row[0] for row in result.result_rows]
+
+
+def fetch_recent_detections(client: Client, database: str, start: float, end: float) -> list[Detection]:
+    """Raw detections in [start, end] (inclusive of both ends, unlike the
+    window-range queries above) — the grouping lookback needs the
+    current window's own just-written detections included, not excluded
+    the way a baseline lookback excludes its own window. See
+    suppression.py.
+    """
+    result = client.query(
+        _RECENT_DETECTIONS_QUERY.format(database=database), parameters={"start": start, "end": end}
+    )
+    detections = []
+    for window_start, target_type, target, detector, severity, observed_value, baseline_value, deviation in (
+        result.result_rows
+    ):
+        if target_type == "edge":
+            caller, callee = target.split("->", 1)
+        else:
+            caller, callee = "", target
+        detections.append(
+            Detection(
+                # clickhouse-connect returns a naive datetime for
+                # DateTime64 — ClickHouse's default column timezone is
+                # UTC (never overridden in this project's schema), and
+                # every window_start this project ever writes is a UTC
+                # unix timestamp (see writer.py's _to_datetime), so the
+                # naive value must be interpreted as UTC explicitly
+                # rather than trusting the container's local timezone.
+                window_start=window_start.replace(tzinfo=timezone.utc).timestamp(),
+                target=TargetKey(target_type, caller, callee),
+                detector=detector,
+                severity=severity,
+                observed_value=observed_value,
+                baseline_value=baseline_value,
+                deviation=deviation,
+            )
+        )
+    return detections
+
+
+def fetch_topology_edges(client: Client, database: str) -> set[tuple[str, str]]:
+    """The full observed caller->callee topology, unrestricted by time —
+    see suppression.py's module docstring for why propagation suppression
+    treats topology as static rather than scoped to a lookback.
+    """
+    result = client.query(_TOPOLOGY_EDGES_QUERY.format(database=database))
+    return {(caller, callee) for caller, callee in result.result_rows}
 
 
 class LateSpan:

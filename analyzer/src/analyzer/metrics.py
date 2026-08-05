@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from prometheus_client import CollectorRegistry, Counter, Histogram
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 
 class Metrics:
@@ -50,6 +50,16 @@ class Metrics:
             "analyzer_baselines_cold_total",
             "Targets whose baseline was below the cold-start sample threshold this window, by target type.",
             ["target_type"],
+            registry=registry,
+        )
+        self.incidents_open = Gauge(
+            "analyzer_incidents_open",
+            "Grouped incidents whose most recent constituent detection was this window (i.e. still firing).",
+            registry=registry,
+        )
+        self.detections_suppressed_total = Counter(
+            "analyzer_detections_suppressed_total",
+            "Detections, this window, that belong to an incident marked derived (a propagated echo, not an independent problem).",
             registry=registry,
         )
 

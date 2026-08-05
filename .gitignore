@@ -7,6 +7,11 @@
 # sweep run artifacts
 /scripts/.loadgen-sweep-bin
 /scripts/sweep_results.jsonl
+/scripts/.loadgen-incident-sweep-bin
+/scripts/incident_sweep_results.jsonl
+
+# local tooling state
+/.claude/
 
 # Node
 node_modules/

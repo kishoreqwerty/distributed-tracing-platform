@@ -12,7 +12,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from analyzer import baseline, chclient, clockskew, config, detectors, httpserver, metrics, reader, reassembly, service_agg, topology_agg, writer
+from analyzer import baseline, chclient, clockskew, config, detectors, httpserver, metrics, reader, reassembly, service_agg, suppression, topology_agg, writer
 from analyzer.windowing import DueWindow, WindowTracker
 
 log = logging.getLogger("analyzer")
@@ -101,7 +101,8 @@ def process_window(client, cfg: config.Config, m: metrics.Metrics, window: DueWi
     offsets = clockskew.estimate_offsets(rows, root_service=cfg.root_service)
     writer.write_clock_offsets(client, cfg.clickhouse_db, window.start, offsets)
 
-    detection_count = run_detection(client, cfg, m, window, services, edges)
+    all_detections = run_detection(client, cfg, m, window, services, edges)
+    incident_count, suppressed_count = run_suppression(client, cfg, m, window, all_detections)
 
     duration = time.monotonic() - start
     m.window_processing_duration_seconds.observe(duration)
@@ -117,7 +118,9 @@ def process_window(client, cfg: config.Config, m: metrics.Metrics, window: DueWi
             "incomplete_count": sum(1 for s in result.summaries if not s.complete),
             "edge_count": len(edges),
             "clock_violation_count": len(violations),
-            "detection_count": detection_count,
+            "detection_count": len(all_detections),
+            "incident_count": incident_count,
+            "suppressed_count": suppressed_count,
             "duration_seconds": round(duration, 4),
         },
     )
@@ -130,10 +133,10 @@ def run_detection(
     window: DueWindow,
     services: list[service_agg.ServiceStats],
     edges: list[topology_agg.ServiceEdge],
-) -> int:
+) -> list[detectors.Detection]:
     """Refreshes service/edge baselines from the trailing lookback, runs
     every detector against the current window, and writes both back to
-    ClickHouse. Returns the number of detections fired, for logging.
+    ClickHouse. Returns this window's raw detections.
     """
     service_baselines, edge_baselines = baseline.refresh_baselines(
         client, cfg.clickhouse_db, window.start, cfg.baseline_lookback_seconds, cfg.baseline_min_samples
@@ -182,7 +185,49 @@ def run_detection(
     for d in all_detections:
         m.detections_total.labels(detector=d.detector, target_type=d.target.kind).inc()
 
-    return len(all_detections)
+    return all_detections
+
+
+def run_suppression(
+    client,
+    cfg: config.Config,
+    m: metrics.Metrics,
+    window: DueWindow,
+    new_detections: list[detectors.Detection],
+) -> tuple[int, int]:
+    """Regroups the trailing lookback's raw detections into incidents and
+    marks any that are likely just an upstream echo of a deeper one as
+    derived, then writes the result. Returns (incidents currently open,
+    of this window's own new detections, how many landed in a derived
+    incident) for logging/metrics.
+
+    Recomputes over the whole lookback rather than incrementally
+    extending yesterday's open incidents in place — the same
+    correctness-over-incremental-state tradeoff baseline.py makes, for
+    the same reason: an incident_id is a deterministic function of
+    (target, detector, start_window), so re-deriving it from a wider
+    read each time and letting ReplacingMergeTree take the latest
+    version is simpler and provably consistent, at the cost of
+    re-reading a bounded window of `detections` every cycle instead of
+    carrying state between calls.
+    """
+    lookback_start = window.start - cfg.grouping_lookback_seconds
+    recent = reader.fetch_recent_detections(client, cfg.clickhouse_db, lookback_start, window.end)
+    edges = reader.fetch_topology_edges(client, cfg.clickhouse_db)
+
+    grouped = suppression.group_detections(recent, window_seconds=float(cfg.window_seconds))
+    incidents = suppression.suppress_propagated(grouped, edges)
+    writer.write_detected_incidents(client, cfg.clickhouse_db, incidents)
+
+    open_count = sum(1 for i in incidents if i.end_window == window.start)
+    m.incidents_open.set(open_count)
+
+    derived_keys = {(i.target.kind, i.target.label(), i.detector) for i in incidents if i.derived}
+    suppressed_count = sum(1 for d in new_detections if (d.target.kind, d.target.label(), d.detector) in derived_keys)
+    if suppressed_count:
+        m.detections_suppressed_total.inc(suppressed_count)
+
+    return len(incidents), suppressed_count
 
 
 def check_late_spans(client, cfg: config.Config, m: metrics.Metrics, boundary: float, since: datetime) -> None:

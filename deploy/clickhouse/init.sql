@@ -276,10 +276,11 @@ ENGINE = ReplacingMergeTree(processed_at)
 ORDER BY (caller_service, callee_service, as_of);
 
 -- detections: one row per (target, detector, window) where a detector
--- fired. Raw and unsuppressed — Phase 3's alert-suppression/grouping
--- layer is a separate, later piece of work; until it exists, expect many
--- detections per real incident (one per window the incident spans), not
--- one row per incident.
+-- fired. Raw and unsuppressed — many rows per real incident (one per
+-- window it spans), not one row per incident; detected_incidents below
+-- is what turns this into incident-level records. This table is never
+-- rewritten or pruned by that later step — grouping/suppression only
+-- ever read it and produce a separate, higher-level view on top.
 --
 -- ORDER BY includes detector, not just (target_type, target, window_start)
 -- — a target can legitimately trip more than one detector in the same
@@ -304,3 +305,35 @@ CREATE TABLE IF NOT EXISTS tracing.detections
 )
 ENGINE = ReplacingMergeTree(processed_at)
 ORDER BY (target_type, target, detector, window_start);
+
+-- detected_incidents: consecutive detections on the same (target,
+-- detector) collapsed into one row with a start, end, and peak severity
+-- (analyzer/src/analyzer/suppression.py's group_detections), plus
+-- whether this incident is likely just an upstream echo of a deeper one
+-- in the call graph rather than an independent problem
+-- (suppress_propagated). incident_id is a deterministic function of
+-- (target, detector, start_window) — recomputing grouping over an
+-- overlapping lookback regenerates the *same* id for an incident that's
+-- still ongoing, so re-inserting it with a later end_window/peak/derived
+-- state is an update under ReplacingMergeTree, not a duplicate.
+--
+-- Nothing here is ever deleted from `detections` — this table is a
+-- read-only view over it, never the other way around. root_cause_incident_id
+-- is '' for a non-derived (independent, or unresolved) incident.
+CREATE TABLE IF NOT EXISTS tracing.detected_incidents
+(
+    incident_id             String,
+    target_type               LowCardinality(String),
+    target                       LowCardinality(String),
+    detector                       LowCardinality(String),
+    start_window                     DateTime64(9),
+    end_window                          DateTime64(9),
+    window_count                           UInt32,
+    peak_severity                             LowCardinality(String),
+    peak_deviation                               Float64,
+    derived                                         UInt8,
+    root_cause_incident_id                             String DEFAULT '',
+    updated_at                                            DateTime64(9) DEFAULT now64(9)
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (incident_id);

@@ -42,6 +42,13 @@ class Config:
     error_rate_min_sample_size: int
     call_rate_threshold: float
 
+    # How far back to look, in seconds, when regrouping raw detections
+    # into incidents each window — see suppression.py. Needs to comfortably
+    # exceed the longest incident this project's sweep expects to see, or
+    # a still-ongoing incident would appear to end and restart every time
+    # its lookback boundary catches up to it.
+    grouping_lookback_seconds: int
+
 
 def load() -> Config:
     return Config(
@@ -63,6 +70,7 @@ def load() -> Config:
         error_rate_threshold=_env_float("ANALYZER_ERROR_RATE_THRESHOLD", 3.0),
         error_rate_min_sample_size=_env_int("ANALYZER_ERROR_RATE_MIN_SAMPLE_SIZE", 10),
         call_rate_threshold=_env_float("ANALYZER_CALL_RATE_THRESHOLD", 3.0),
+        grouping_lookback_seconds=_env_int("ANALYZER_GROUPING_LOOKBACK_SECONDS", 300),
     )
 
 
