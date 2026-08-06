@@ -1011,3 +1011,64 @@ in the test's own log, "writer restart command returned") — that
 field only counts restarts triggered by the restart *policy* after a
 crash, not a manual `docker restart`, a Docker API detail worth not
 misreading as "the restart didn't happen."
+
+### Recovery: throttled ClickHouse — the surprise of this deliverable
+
+**Partial degradation behaved *better* than either crash scenario
+above, not worse.** 10,000 spans/sec (3 parallel loadgen processes,
+300s total) — `docker update --cpus 0.2 deploy-clickhouse-1` at t=60s
+(down from its configured 3.0), `docker update --cpus 3.0` at t=180s.
+Not killed at any point — the explicit point of this test, per the
+phase brief's own framing that a slow-but-alive downstream is more
+realistic than a clean outage and "often behaves worse."
+
+| Window | Published/consumed | Flush p99 | Consumer lag |
+|---|---|---|---|
+| Before throttle (0-60s) | ~9,900/s, tracking | 0.02-0.05s | 638-4,034, sawtooth-bounded |
+| Throttled (75-165s) | ~6,000-7,500/s (self-moderated, not collapsed) | **0.48-2.23s** (10-100x worse) | 997-3,993 — still bounded, no runaway growth |
+| After restore (195-300s) | ~10,000/s, back to baseline | **0.01-0.09s** — recovered within the first 15s sample | 564-5,046, back to the same pre-throttle sawtooth range |
+
+**Zero data loss, and ClickHouse itself never crashed:**
+`docker inspect deploy-clickhouse-1` after the test: `Status=running,
+OOMKilled=false, RestartCount=0`. `loadgen`'s own aggregate reported
+2,580,564 sent spans with zero send failures; `SELECT count() FROM
+tracing.spans` returned **2,580,564** — an exact match, through a
+120-second window where ClickHouse was running at under 7% of its
+normal CPU allocation.
+
+**This directly contradicts the phase brief's own working hypothesis**
+that partial degradation would behave worse than a clean outage. It
+didn't, here: flush duration rose sharply (a real, visible, correctly-
+alarming signal) but consumer lag stayed *bounded* rather than growing
+without limit — the writer's batching and retry logic absorbed a
+10-100x slowdown in ClickHouse's own responsiveness without ever
+losing data or requiring the collector to reject anything, and
+recovery once the constraint lifted was immediate, not gradual and not
+stuck the way redpanda's was. The likely reason this scenario stayed
+gentle where the other two didn't: CPU throttling degrades ClickHouse's
+own *throughput* smoothly (a slower CPU still eventually finishes
+each query), where the other two failures were both hard resource
+walls (a memory pool that either has room or doesn't) with no graceful
+middle state to degrade through. Worth being precise about what this
+result does and doesn't generalize to: it says CPU-bound degradation
+of ClickHouse specifically is well-tolerated by this pipeline's
+existing backpressure design, not that every kind of partial
+degradation would be.
+
+### Recovery: summary across all three scenarios
+
+| Scenario | Component affected | Crashed? | Data loss? | Recovered? |
+|---|---|---|---|---|
+| Overload then known-good rate | redpanda (memory) | Yes, repeatedly | Not measured (pipeline was down) | **No** — stuck `unhealthy` indefinitely, needed manual recreation |
+| Writer restart mid-load | writer (process) | N/A — deliberate restart | **None** — exact row-count match | **Yes** — clean rebalance, lag to 0 |
+| ClickHouse throttled (not killed) | clickhouse (CPU) | No | **None** — exact row-count match | **Yes** — immediate, full |
+
+The common thread isn't "crashes are bad" — it's that **recovery
+quality tracks whether the affected component has a bounded, gradual
+way to shed load.** The writer and ClickHouse-under-throttling both
+had one (redeliver an uncommitted batch; take longer per query) and
+recovered cleanly. Redpanda's failure mode — a hard internal memory
+wall with no graceful degradation path — didn't, twice, in two
+different specific ways (crash-looping in the soak, stuck-unhealthy
+here). That distinction, not a generic "restart policies help," is
+this deliverable's real finding.
