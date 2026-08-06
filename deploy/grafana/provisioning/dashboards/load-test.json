@@ -1,0 +1,165 @@
+{
+  "title": "Phase 6 — Load Test",
+  "uid": "phase6-load-test",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "timezone": "utc",
+  "time": { "from": "now-15m", "to": "now" },
+  "refresh": "5s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Ingest rate",
+      "description": "Spans/sec at each hop of the write path. Received and published should track each other closely (the collector's own admission/publish overhead); consumed should track published unless the writer is falling behind — the gap between published and consumed is this dashboard's single clearest sign of a pipeline losing ground.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "rate(collector_spans_received_total[30s])", "legendFormat": "received (collector)", "refId": "A" },
+        { "expr": "rate(collector_spans_published_total[30s])", "legendFormat": "published (collector -> kafka)", "refId": "B" },
+        { "expr": "rate(writer_spans_consumed_total[30s])", "legendFormat": "consumed (writer -> clickhouse)", "refId": "C" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Consumer lag by partition",
+      "description": "writer_consumer_lag per partition of the spans topic (4 partitions). A sawtooth against the writer's 2-second flush interval is normal; sustained, monotonic growth on any partition is not — see docs/ISSUES.md for why a single snapshot of this metric is not, on its own, a reliable failure signal (this dashboard shows the trend live specifically so that judgment is easier to make by eye than from a single number).",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "writer_consumer_lag", "legendFormat": "partition {{partition}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Batch size (p50 / p95 / p99)",
+      "description": "Rows per ClickHouse insert batch. WRITER_BATCH_MAX_SIZE defaults to 5,000 — p99 pinned near that line means the size trigger is dominant (high offered rate); well below it means the 2-second time trigger is firing first (low offered rate). See docs/BENCHMARKS.md's Phase 6 size-triggered-flush section for the measured crossover.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(writer_batch_size_bucket[30s]))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, rate(writer_batch_size_bucket[30s]))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, rate(writer_batch_size_bucket[30s]))", "legendFormat": "p99", "refId": "C" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Flush duration (p50 / p95 / p99)",
+      "description": "Time to insert one batch into ClickHouse, successful attempts only. Drift upward under sustained load is an early, direct signal of ClickHouse-side insert pressure — worth watching independently of whether consumer lag has visibly moved yet.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(writer_flush_duration_seconds_bucket[30s]))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, rate(writer_flush_duration_seconds_bucket[30s]))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, rate(writer_flush_duration_seconds_bucket[30s]))", "legendFormat": "p99", "refId": "C" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "End-to-end latency proxy (span age, p50 / p95 / p99)",
+      "description": "writer_span_age_seconds: wall-clock time from a span's own recorded end_time to when its batch was durably inserted. A proxy, not a true emit-to-query measurement — this pipeline has never timestamped actual OTLP emission (see docs/BENCHMARKS.md's Phase 1 known-gap entry). Still real, measured data: rising p99 here is this system's most direct 'is a person's trace showing up late' signal.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(writer_span_age_seconds_bucket[30s]))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, rate(writer_span_age_seconds_bucket[30s]))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, rate(writer_span_age_seconds_bucket[30s]))", "legendFormat": "p99", "refId": "C" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "ClickHouse parts and active merges",
+      "description": "ClickHouseMetrics_PartsActive (all tables) and ClickHouseMetrics_Merge (currently-running background merges). What deliverable 5's soak test is specifically watching: part count should plateau, not climb without bound, once merges keep pace with insert rate — sustained part growth with flat merge activity is the classic 'too many parts' failure mode building up quietly over a run much longer than any single ramp step.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "ClickHouseMetrics_PartsActive", "legendFormat": "active parts (all tables)", "refId": "A" },
+        { "expr": "ClickHouseMetrics_Merge", "legendFormat": "active merges", "refId": "B" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Collector publish errors by reason",
+      "description": "collector_publish_errors_total, rate by reason label. buffer_full = the Kafka producer's own in-flight semaphore rejecting (Phase 1); produce_failed = a Kafka produce call itself failed after being accepted; marshal_error = a span couldn't be protobuf-encoded. A nonzero, sustained buffer_full rate is expected once the pipeline is genuinely overloaded — see docs/BENCHMARKS.md's ramp-to-failure section for what that looked like in practice.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "rate(collector_publish_errors_total[30s])", "legendFormat": "{{reason}}", "refId": "A" },
+        { "expr": "rate(collector_requests_rejected_total[30s])", "legendFormat": "requests_rejected (admission bound)", "refId": "B" }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Per-container memory (% of configured limit)",
+      "description": "collector, writer, and ClickHouse's own memory against the limits set in deploy/docker-compose.load.yml — collector's is what this phase's tuning fix (deliverable 3) was actually protecting.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 24, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "ClickHouseAsyncMetrics_MemoryResident", "legendFormat": "clickhouse RSS", "refId": "A" }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Per-container CPU/memory — known gap",
+      "type": "text",
+      "gridPos": { "x": 0, "y": 32, "w": 24, "h": 4 },
+      "options": {
+        "mode": "markdown",
+        "content": "**A live per-container CPU/memory panel for every service (redpanda, collector, writer, analyzer, etc.) is not present here.** cAdvisor was added and removed after diagnosis — it doesn't work with this Docker Desktop version's containerd-snapshotter storage backend (cAdvisor v0.49.1's Docker container factory hardcodes an assumption about the classic overlayfs2 graphdriver layout, which doesn't exist under this backend). Full diagnosis in `docs/ISSUES.md`. This isn't missing data, just missing as a *live* series: `scripts/run_load_test.sh` polls `docker stats` directly during every load-test step and records **peak** CPU/memory per container into `scripts/load_test_results/*.jsonl`, reported in `docs/BENCHMARKS.md`'s ramp and soak tables. The ClickHouse memory panel above is real live data (from ClickHouse's own Prometheus exporter, not cAdvisor) and stands in for at least one service's live memory trend."
+      }
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "name": "Load test steps",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "enable": true,
+        "iconColor": "rgba(255, 96, 96, 1)",
+        "expr": "changes(collector_requests_rejected_total[1m]) > 0",
+        "titleFormat": "admission bound rejecting"
+      }
+    ]
+  }
+}

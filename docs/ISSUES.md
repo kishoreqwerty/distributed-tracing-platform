@@ -1293,3 +1293,50 @@ container's kernel view of available CPUs happens to be. Either would
 need its own re-run to confirm before trusting it, which this entry
 deliberately doesn't do — recorded as a confirmed mechanism and an
 available-but-untaken next step, not a fix.
+
+### cAdvisor doesn't work on this Docker Desktop version — a real, diagnosed incompatibility, not a misconfiguration
+
+**Symptom:** added to `deploy/docker-compose.load.yml` for deliverable
+7's live per-container CPU/memory dashboard panel. Started cleanly,
+registered its Docker container factory successfully, and then
+exposed exactly one `container_memory_usage_bytes` series — the root
+cgroup (`id="/"`) — with every actual service container silently
+missing.
+
+**Root cause, confirmed from cAdvisor's own logs, not guessed:**
+
+```
+Failed to create existing container: /docker/<id>: failed to identify
+the read-write layer ID for container "<id>". - open
+/rootfs/var/lib/docker/image/overlayfs/layerdb/mounts/<id>/mount-id:
+no such file or directory
+```
+
+`docker info --format '{{.Driver}}'` on this machine reports
+`overlayfs` with `driver-type: io.containerd.snapshotter.v1` — Docker
+Desktop's newer containerd-snapshotter storage backend, not the
+classic Docker overlayfs2 graphdriver. cAdvisor v0.49.1's Docker
+container factory hardcodes an assumption about the classic
+graphdriver's on-disk layout (`image/overlayfs/layerdb/mounts/<id>/
+mount-id`) to look up each container's read-write layer; that file
+simply doesn't exist under the containerd-snapshotter backend, so
+every container fails this one lookup and gets dropped entirely,
+rather than the factory degrading gracefully and reporting CPU/memory
+without filesystem stats. Two follow-up attempts — mounting
+`/var/run/docker.sock` explicitly (the plain `/var/run:/var/run:ro`
+mount didn't expose it usably), then adding `pid: host`, `privileged:
+true`, and `--docker_only=true` — changed nothing, because neither
+touches the actual failing code path.
+
+**Not fixed — removed rather than left broken in the compose file.**
+This is a real compatibility gap between cAdvisor's Docker integration
+and a storage backend Docker Desktop now ships by default, not
+something wrong with this project's own configuration; a version of
+cAdvisor with containerd-snapshotter support (if one exists) or a
+different container-metrics exporter entirely would be the next thing
+to try, neither attempted here. Per-container CPU/memory data isn't
+lost as a result — `scripts/run_load_test.sh` already polls `docker
+stats` directly during every load-test step and records peak usage
+per container into `scripts/load_test_results/*.jsonl` (see
+`docs/BENCHMARKS.md`) — it just isn't available as a live, continuous
+Grafana time series the way the other five dashboard panels are.

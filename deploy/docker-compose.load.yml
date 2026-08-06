@@ -132,3 +132,14 @@ services:
   grafana:
     cpus: 0.25
     mem_limit: 256m
+
+  # cAdvisor was tried here for deliverable 7's live per-container
+  # CPU/memory panel and removed — it doesn't work on this Docker
+  # Desktop version's storage backend (containerd snapshotter, not the
+  # classic overlayfs2 graphdriver cAdvisor v0.49.1's Docker factory
+  # expects) and there's no fix available at this cAdvisor version, not
+  # a misconfiguration on this file's part. See docs/ISSUES.md for the
+  # full diagnosis. Per-container resource data still exists — it's
+  # captured directly by scripts/run_load_test.sh's own docker stats
+  # polling into scripts/load_test_results/*.jsonl — just not as a live
+  # Grafana time series.
