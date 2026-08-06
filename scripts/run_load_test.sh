@@ -14,6 +14,15 @@
 #     failure definition below, rather than continuing to load an
 #     already-failing system.
 #
+#   run_load_test.sh clean
+#     Truncates every hot-path and ground-truth table so part count,
+#     merge activity, and row counts start from zero — this stack has
+#     been reused across every earlier phase's testing and demo data in
+#     this same session, so without this a ramp's "part count grew from
+#     X to Y" reading would be measuring growth on top of an arbitrary,
+#     already-large pre-existing baseline instead of from a clean
+#     start. Run once before a real (non-smoke-test) profile.
+#
 # Requires: the compose stack up with the eval + load overlays —
 #   cd deploy && docker compose -f docker-compose.yml \
 #     -f docker-compose.eval.yml -f docker-compose.load.yml up -d --build
@@ -27,16 +36,20 @@
 # Prometheus snapshot, docker stats snapshot).
 #
 # Failure definition (the phase's own "define failure precisely before
-# you start"): a step FAILS if summed writer_consumer_lag across all 4
-# partitions is higher at the end of the held step than a short window
-# after the step's own warmup — i.e. lag is still growing when the hold
-# ends, not just non-zero. A step that ends with stable (non-growing,
-# even if nonzero) lag PASSES. This is the primary, sole trigger for
-# stopping a ramp early. Span loss, end-to-end latency, and container
-# restarts/OOM are recorded at every step as supporting evidence, not
-# as independent failure triggers — see docs/DECISIONS.md for why
-# unbounded lag growth was chosen as the one primary signal instead of
-# a multi-condition OR.
+# you start"): a step FAILS if, over its own held window, the rate the
+# writer actually consumed and durably inserted fell more than 2%
+# short of the rate the collector actually published to Kafka — the
+# writer falling behind the pipeline's own upstream, not just an
+# instantaneous lag reading. A step where consumed keeps pace with
+# published PASSES, even with nonzero (but flat) lag. This is the
+# primary, sole trigger for stopping a ramp early. Span loss,
+# end-to-end latency, and container restarts/OOM are recorded at every
+# step as supporting evidence, not as independent failure triggers —
+# see docs/DECISIONS.md for why this, not a multi-condition OR. An
+# earlier version of this check compared the raw writer_consumer_lag
+# gauge instead and had to be replaced — see docs/ISSUES.md for why an
+# instantaneous lag snapshot turned out not to be a reliable signal at
+# all, healthy or not.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -140,7 +153,52 @@ run_step() {
       > "$tmp_dir/proc-$i.log" 2>&1 &
     pids+=($!)
   done
+
+  # Sample container CPU/mem every 5s for as long as this step's own
+  # traffic is running, rather than relying on the before/after
+  # bookends alone — those two snapshots bracket the step but land
+  # outside its actively-loaded window, so on their own they'd show
+  # every service looking idle regardless of how loaded it actually
+  # got mid-step (found live at the 20,000 spans/sec step — see
+  # docs/ISSUES.md). Reports peak, not average, since a bottleneck
+  # shows up at its worst moment, not smoothed across one.
+  local stats_log="$tmp_dir/stats_samples.jsonl"
+  : > "$stats_log"
+  (
+    while kill -0 "${pids[0]}" 2>/dev/null; do
+      docker stats --no-stream --format '{{json .}}' >> "$stats_log" 2>/dev/null
+      sleep 5
+    done
+  ) &
+  local sampler_pid=$!
+
   for pid in "${pids[@]}"; do wait "$pid"; done
+  kill "$sampler_pid" 2>/dev/null || true
+  wait "$sampler_pid" 2>/dev/null || true
+
+  local docker_stats_peak
+  docker_stats_peak="$(python3 -c "
+import json
+peaks = {}
+for line in open('$stats_log'):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        s = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if not s.get('Name', '').startswith('deploy-'):
+        continue
+    try:
+        cpu = float(s['CPUPerc'].rstrip('%'))
+    except (KeyError, ValueError):
+        continue
+    name = s['Name']
+    if name not in peaks or cpu > peaks[name]['cpu_peak_percent']:
+        peaks[name] = {'cpu_peak_percent': cpu, 'mem_at_peak': s.get('MemUsage'), 'mem_perc_at_peak': s.get('MemPerc')}
+print(json.dumps(peaks))
+")"
 
   # Each process's stdout ends with one JSON-ish structured log line
   # (slog's default text handler, not JSON — parse the key=value pairs
@@ -196,6 +254,7 @@ record = {
     'clickhouse': json.loads('''$ch_snapshot'''),
     'docker_stats_before': json.loads('''$docker_stats_before'''),
     'docker_stats_after': json.loads('''$docker_stats_after'''),
+    'docker_stats_peak_during_step': json.loads('''$docker_stats_peak'''),
 }
 print(json.dumps(record))
 " >> "$out_file"
@@ -281,22 +340,40 @@ print(json.dumps(out))
 "
 }
 
-# --- Failure check: has summed consumer lag grown across this step,
-# comparing the step's own record against the previous one in the same
-# output file. Returns 0 (pass) or 1 (fail) via exit code.
-step_lag_growing() {
+# --- Failure check: over THIS step's own window, was the rate the
+# collector actually published to Kafka higher than the rate the
+# writer actually consumed and durably inserted? Returns 0 (pass) or 1
+# (fail) via exit code.
+#
+# Not based on the raw writer_consumer_lag gauge — its instantaneous
+# value is a sawtooth against the writer's own flush cadence (up to
+# WRITER_FLUSH_INTERVAL=2s or 5000 rows between flushes), so a single
+# snapshot's absolute size scales with offered rate even at zero real
+# backlog growth, and even two same-step snapshots (tried first: a
+# step's own midpoint vs its end) can disagree several-fold purely from
+# sawtooth phase and this step's own post-drain ramp-up, independent of
+# whether anything is actually falling behind (both found live, not
+# hypothesized — see docs/ISSUES.md).
+#
+# published_rate vs consumed_rate, both already rate()-windowed over
+# this same step's own duration, is the direct definition of queueing
+# stability (arrival rate vs. service rate) and is immune to flush-
+# timing sawtooth entirely, since it's already integrated over the
+# whole window rather than sampled at an instant. A 2% tolerance
+# absorbs ordinary measurement/rounding noise between two independently
+# scraped counters without absorbing a real, sustained shortfall.
+step_falling_behind() {
   local out_file="$1"
   python3 -c "
 import json
 lines = [json.loads(l) for l in open('$out_file')]
-if len(lines) < 2:
-    exit(0)  # nothing to compare yet, can't have failed
-def total_lag(rec):
-    return sum(float(r['value'][1]) for r in rec['prometheus']['writer_consumer_lag_by_partition'])
-prev, curr = lines[-2], lines[-1]
-prev_lag, curr_lag = total_lag(prev), total_lag(curr)
-print(f'lag: {prev_lag} -> {curr_lag}', file=__import__('sys').stderr)
-exit(1 if curr_lag > prev_lag else 0)
+curr = lines[-1]
+def rate_of(series):
+    return float(series[0]['value'][1]) if series else 0.0
+published = rate_of(curr['prometheus']['collector_spans_published_rate'])
+consumed = rate_of(curr['prometheus']['writer_spans_consumed_rate'])
+print(f'published={published:.1f}/s consumed={consumed:.1f}/s', file=__import__('sys').stderr)
+exit(1 if consumed < published * 0.98 else 0)
 "
 }
 
@@ -314,17 +391,39 @@ case "$mode" in
     echo "environment: $(environment_json)" >&2
     for rate in "$@"; do
       out_file="$(run_step "$rate" "$hold" "step-${rate}spans")"
-      if ! step_lag_growing "$out_file"; then
-        log "consumer lag grew across this step at ${rate} spans/sec offered — stopping ramp (failure definition met)"
-        break
+      if ! step_falling_behind "$out_file"; then
+        # A single failing step isn't trusted on its own — two
+        # independently-scraped rate() counters can disagree by a few
+        # percent from ordinary measurement noise alone (found live: a
+        # step that failed by 3.7% in one ramp attempt passed with a
+        # comfortable margin in 3 immediate repeats at the identical
+        # rate — see docs/ISSUES.md). Confirm with one immediate
+        # re-run of the same rate before accepting it as the ramp's
+        # real stopping point, rather than truncating on noise.
+        log "${rate} spans/sec failed once — confirming with an immediate re-run before accepting it as the breaking point..."
+        confirm_file="$(run_step "$rate" "$hold" "step-${rate}spans-confirm")"
+        if ! step_falling_behind "$confirm_file"; then
+          log "confirmed: writer consumed less than the collector published at ${rate} spans/sec on both attempts — stopping ramp (failure definition met)"
+          break
+        fi
+        log "re-run passed — treating the first failure as noise, continuing the ramp"
       fi
       log "cooling down 10s before next step..."
       sleep 10
     done
     ;;
+  clean)
+    tables="spans span_classifications trace_summaries service_stats service_edges service_clock_offsets service_baselines edge_baselines detections detected_incidents ground_truth_spans ground_truth_edges ground_truth_clock_offsets ground_truth_incidents"
+    for t in $tables; do
+      log "truncating tracing.$t"
+      docker exec deploy-clickhouse-1 clickhouse-client --password "$CLICKHOUSE_PASSWORD" --query "TRUNCATE TABLE tracing.$t"
+    done
+    log "clean: done"
+    ;;
   *)
     echo "usage: $0 single <spans_per_sec> <duration_seconds> [label]" >&2
     echo "       $0 ramp <step_hold_seconds> <rate1> [rate2] ..." >&2
+    echo "       $0 clean" >&2
     exit 1
     ;;
 esac

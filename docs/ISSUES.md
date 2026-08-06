@@ -1028,3 +1028,170 @@ local to "now" rather than averaging across the entire soak every
 time. Re-verified against the same 500 spans/sec, 20s step: the
 received-rate reading moved to 439.7/sec, in line with what was
 actually generated.
+
+### The ramp's own failure check produced a false stop at 500 spans/sec, and again — after a first fix — at 5000
+
+**Symptom, round one:** running the real ramp for the first time, it
+stopped after the *second* step, reporting "consumer lag grew" at 500
+spans/sec — a rate two more full orders of magnitude below anything
+this phase cares about, with every other signal (flush latency,
+publish errors, ClickHouse part count) looking completely healthy.
+
+**Root cause, round one:** the original check compared summed
+`writer_consumer_lag` at the end of one step against the end of the
+*previous* step — a different step, at a different offered rate.
+Lag's absolute value at a single instant scales with offered rate
+even at zero real backlog growth: at any point between the writer's
+2-second flush ticks, roughly `rate * flush_interval` messages are
+sitting unflushed by construction. `500 * 2 = 1000`, matching the
+`992` reading that triggered the stop almost exactly, while the
+writer's own consumed rate was simultaneously *higher* than the
+received rate during that very step — direct proof it was keeping up,
+not falling behind.
+
+**First fix, and why it wasn't enough:** switched to comparing a
+mid-step lag sample against the step's own end, so both readings were
+at least at the same rate. Smoke-testing this immediately showed
+*it also* produced a large apparent jump (499 to 1511 lag) on a
+step that was, by every other measure, healthy — the writer_consumer_lag
+gauge turned out to be too noisy a signal for a two-point comparison
+regardless of which two points are chosen: its sawtooth shape
+(rising between flushes, dropping at each flush) and this step's own
+post-drain ramp-up transient can each independently produce a
+large-looking jump with no real backlog growth underneath it.
+
+**Real fix:** stopped trying to read the raw lag gauge for this
+purpose at all. `collector_spans_published_rate` and
+`writer_spans_consumed_rate`, both already `rate()`-windowed over the
+same step's own duration, are the direct definition of queueing
+stability (arrival rate vs. service rate) and are immune to flush-
+timing sawtooth entirely — they're integrated over the whole window,
+not sampled at an instant. A step now fails only if consumed falls
+more than 2% short of published over its own window.
+
+**Symptom, round two — even the fixed check wasn't fully trustworthy
+on a single sample:** re-running the ramp with the rate-based check,
+5000 spans/sec failed once (published 4974.4/s, consumed 4789.0/s, a
+3.7% shortfall) with the ramp stopping there — but an *earlier* full
+ramp run had this exact same rate pass cleanly (4952.6/s vs
+4956.7/s), and 3 immediate dedicated repeats at 5000 spans/sec all
+passed comfortably afterward (ratios 0.998-1.011). Nothing in any of
+the peak resource data at this rate showed real saturation. The 2%
+threshold, it turns out, is tight enough that two independently
+scraped Prometheus counters can occasionally disagree by more than
+that from ordinary measurement noise alone, at a rate nowhere near
+the pipeline's real limit.
+
+**Fix:** the ramp no longer accepts a single failing step as the true
+stopping point — it immediately re-runs the same rate once, and only
+stops for real if the repeat also fails. A step whose failure doesn't
+reproduce is logged and the ramp continues. This traded a small
+amount of extra wall-clock time (one repeated step, only when a
+failure is seen at all) for not truncating the ramp on a single noisy
+sample — which, given the whole point of this deliverable is finding
+where the system *actually* breaks, is not a trade worth avoiding.
+
+### Docker stats snapshots taken right before and after a step showed every service idle, even at 20,000 spans/sec
+
+**Symptom:** the ramp's recorded container CPU/memory for the
+20,000 spans/sec step showed collector at 0.00% CPU and writer at
+0.01% — obviously wrong for a step that had just moved nearly 19,500
+spans/sec through both of them.
+
+**Root cause:** the harness only ever captured two `docker stats`
+snapshots per step, one right before the fan-out started and one
+~3 seconds after it finished. Both bracket the step's actual loaded
+window rather than falling inside it — by the time either snapshot is
+taken, the burst of traffic that would show a service under load has
+already come and gone (or not yet started). The before/after pair is
+fine for *idle* baseline context but says nothing about what happened
+during the step, which is the entire thing this phase's deliverable 2
+asks to record.
+
+**Fix:** the harness now polls `docker stats` every 5 seconds for as
+long as the step's own loadgen fan-out is still running, and records
+each service's *peak* CPU/memory across those samples rather than a
+single before/after pair. Peak, not average, because a bottleneck
+shows up at its worst moment — smoothing across the step would hide
+exactly the thing this deliverable exists to find. This is also what
+actually surfaced the real breaking point later in the same run:
+collector's peak memory read 99.95% of its configured 512MB limit at
+the step where it was OOM-killed, a reading the old before/after
+snapshots would have missed entirely (by the time the "after"
+snapshot could have been taken, the container was already dead).
+
+### The actual breaking point: redpanda aborts on its own memory limit, then takes the collector down with it — and neither comes back
+
+**Symptom:** the ramp held cleanly through 20,000 spans/sec (published
+and consumed rates tracking each other within a fraction of a
+percent, every latency and error metric flat) and then collapsed
+completely by 40,000-80,000: 705,799 of ~1.4M attempted sends failed
+at 40,000 spans/sec, and *zero* succeeded at 80,000. The 80,000 step
+also took 8 minutes of wall clock instead of its intended 2 — a sign
+something well beyond "the pipeline is slow" was happening.
+
+**Root cause, traced through container state and logs, not
+inferred:** `docker inspect deploy-redpanda-1` showed `Exited (133)`
+at `05:25:45` — mid-way through the 40,000 spans/sec step — and its
+own log at that exact timestamp read:
+
+```
+ERROR ... seastar - Failed to allocate 32768 bytes
+Aborting on shard 3.
+```
+
+Redpanda's seastar engine exhausted its own memory pool (the 2GB
+`mem_limit` configured in `deploy/docker-compose.load.yml`) and
+aborted itself outright — a hard internal crash, not a graceful
+backpressure response, and not the Linux kernel's OOM killer (`docker
+inspect` confirms `OOMKilled: false` for this container specifically —
+the process aborted itself before the kernel needed to intervene).
+
+With the broker gone, the collector's Kafka producer could no longer
+drain the messages it had already accepted — its own logs show a wall
+of `"kafka producer in-flight buffer full"` warnings starting exactly
+at the crash. That buffer has no upper bound tied to the collector's
+own memory budget: it kept growing while spans kept arriving from the
+(by then 12-24 parallel) load generator, until the collector's own
+512MB `mem_limit` was exhausted and the Linux kernel OOM-killed it —
+confirmed directly: `docker inspect deploy-collector-1` shows
+`OOMKilled: true, ExitCode: 137`, at `05:27:59`, almost exactly when
+the 80,000 spans/sec step began. `docker_stats_peak_during_step` for
+that step shows collector's memory at `511.8MiB / 512MiB` — 99.95% of
+its configured limit — immediately before the kill.
+
+**Neither service came back.** `docker-compose.yml` sets no restart
+policy on any service (only the one-shot `redpanda-topic-init` job
+gets an explicit `restart: "no"`, and every other service silently
+inherits Docker's own default of no automatic restart at all). Both
+containers sat in `Exited` state, and the entire pipeline stayed down,
+until this was noticed and the stack was manually brought back up —
+there is currently no self-healing path from either failure mode.
+
+**A separate, independent, earlier failure — not part of the same
+chain:** `docker inspect deploy-analyzer-1` shows `OOMKilled: true` at
+`04:55:02`, which lands mid-way through a *different*, earlier ramp
+attempt's 20,000 spans/sec step — one where the write path (collector
+through ClickHouse) was still completely healthy. The analyzer holds
+an entire window's worth of spans in Python-process memory to
+reassemble and aggregate, and Python's per-object memory overhead is
+far higher than the Go services on the write path; its own 512MB
+limit was exhausted by span *volume* well before the ingest pipeline
+itself showed any strain. This means the system has **two different
+breaking points depending on which capability is asked for**: the raw
+ingest path holds past 20,000 spans/sec (up to wherever redpanda's own
+limit sits, between 20,000 and 40,000), but the analysis layer already
+fails at or before 20,000 — a materially lower number, and the one
+that actually matters if "the system works" is read to include trace
+reassembly and detection, not just durable storage.
+
+**Not fixed as of this ramp — reported as found, root-caused, and
+reproducible.** The proximate trigger (redpanda's 2GB memory limit
+being too tight for sustained throughput in this range) and the
+secondary amplifier (the collector's unbounded in-flight buffer with
+no backpressure to its own upstream once the broker is unreachable)
+are two independently addressable things, and which one is worth
+tuning first — and by how much — is exactly what this phase's
+bottleneck-and-tuning deliverable exists to determine, not something
+to guess at here. See docs/BENCHMARKS.md for the full ramp table this
+was measured against.
