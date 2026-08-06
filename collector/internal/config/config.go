@@ -19,6 +19,12 @@ type Config struct {
 	KafkaTopic           string
 	KafkaMaxInFlight     int
 	KafkaDeliveryTimeout time.Duration
+
+	// MaxConcurrentExports bounds how many OTLP Export requests the gRPC
+	// server will process at once, independent of KafkaMaxInFlight — see
+	// internal/admission's package doc for why that bound alone isn't
+	// enough once the broker itself is unreachable.
+	MaxConcurrentExports int
 }
 
 // Load reads configuration from environment variables, applying defaults
@@ -33,6 +39,8 @@ func Load() (Config, error) {
 		KafkaTopic:           getEnv("KAFKA_TOPIC", "spans"),
 		KafkaMaxInFlight:     2000,
 		KafkaDeliveryTimeout: 30 * time.Second,
+
+		MaxConcurrentExports: 256,
 	}
 
 	if raw := os.Getenv("COLLECTOR_SHUTDOWN_TIMEOUT_SECONDS"); raw != "" {
@@ -57,6 +65,14 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("invalid KAFKA_DELIVERY_TIMEOUT_SECONDS: %w", err)
 		}
 		cfg.KafkaDeliveryTimeout = time.Duration(secs) * time.Second
+	}
+
+	if raw := os.Getenv("COLLECTOR_MAX_CONCURRENT_EXPORTS"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid COLLECTOR_MAX_CONCURRENT_EXPORTS: %w", err)
+		}
+		cfg.MaxConcurrentExports = n
 	}
 
 	if len(cfg.KafkaBrokers) == 0 {

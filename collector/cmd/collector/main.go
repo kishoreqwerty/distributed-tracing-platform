@@ -22,6 +22,7 @@ import (
 
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 
+	"github.com/kishoresj/distributed-tracing-platform/collector/internal/admission"
 	"github.com/kishoresj/distributed-tracing-platform/collector/internal/config"
 	"github.com/kishoresj/distributed-tracing-platform/collector/internal/httpserver"
 	"github.com/kishoresj/distributed-tracing-platform/collector/internal/kafkaproducer"
@@ -67,7 +68,9 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.UnaryInterceptor(admission.UnaryInterceptor(cfg.MaxConcurrentExports, m)),
+	)
 	coltracepb.RegisterTraceServiceServer(grpcServer, otlpreceiver.New(logger, producer, m))
 
 	healthServer := health.NewServer()

@@ -560,9 +560,181 @@ for.
 
 ## Phase 5 — TBD
 
-## Phase 6 — Fault injection & load characterization
+## Phase 6 — Load testing & failure mode characterization
 
-- Behavior under induced clock skew:
-- Behavior under out-of-order span delivery:
-- Behavior under simulated span drops:
-- Max sustained ingest rate before backpressure/degradation:
+**Everything below is co-located on one laptop** — every service (Redpanda,
+ClickHouse, collector, writer, analyzer, Prometheus, Grafana) plus the load
+generator itself shares one machine's CPU, memory, disk, and loopback
+network. **This is not a production benchmark and must not be read as
+one.** What it legitimately measures is *relative* behavior on this one
+box: which component saturates first, how the system degrades, whether
+failure is graceful or catastrophic — not an absolute number that would
+hold on different hardware, a different network, or with these services
+actually distributed.
+
+**Test environment:**
+
+| | |
+|---|---|
+| Machine | Apple M5 Pro, 15 cores, 24GiB RAM, SSD (Apple Fabric/NVMe) |
+| Docker Desktop allocation | 15 CPU / 7.75GiB RAM — the real ceiling every container competes inside, not the host's full spec |
+| Per-service resource limits | `deploy/docker-compose.load.yml`; rationale for each in `docs/DECISIONS.md` |
+| Docker Server | 29.6.1 |
+
+### Measurement reliability — a finding in its own right
+
+Getting a trustworthy ramp result out of this phase's own harness took
+four rounds of fixes before its failure-detection logic could be
+trusted at all (full detail in `docs/ISSUES.md`): comparing consumer
+lag across steps produced a false failure at 500 spans/sec; comparing
+it within a single step produced another false failure on a
+completely healthy step; the fix that actually worked — comparing
+published rate to consumed rate over each step's own window — still
+needed a confirm-on-failure re-run after a single noisy sample nearly
+truncated the ramp at 5,000 spans/sec, a rate that turned out to be
+solidly fine.
+
+This is not an isolated Phase 6 problem. Counting it, **five separate
+measurement-apparatus bugs have now been found across three phases**,
+and every one of them was the *harness* or the *evaluation code* being
+wrong, not the system under test:
+
+1. **Phase 2** — the eval harness's own window/watermark configuration
+   (10s/20s window, 5s watermark) was too tight for this pipeline's
+   real end-to-end latency under load: a clean, fault-free baseline run
+   logged 39% of all spans as falsely "late," an artifact of the
+   *harness's* timing choice, not anything wrong with reassembly. Fixed
+   by widening the eval overlay to 20s/15s and re-verifying zero false
+   lates on the same clean baseline.
+2. **Phase 3** — `eval.py`'s incident precision was scored over the
+   *entire* evaluated time range instead of just each true incident's
+   own active window, silently counting ordinary process-boundary
+   `call_rate` noise from between sweep points as false positives.
+   Aggregate measured precision moved from 0.188 to 0.409 after the
+   fix — over double — with the underlying detector behavior
+   completely unchanged.
+3. **Phase 3** — `eval.py`'s observed-magnitude calculation for
+   `edge_disappearance` read whatever ClickHouse row happened to be
+   returned by an unbounded backward search, rather than treating a
+   genuinely absent window as the real zero it was. Three identically
+   configured runs reported wildly different magnitudes (0.047, 0.936,
+   0.828) for a fault that should read ~1.0 every time; after the fix,
+   all three read exactly 1.0.
+4. **Phase 3** — `eval.py`'s detection latency was computed against
+   the wrong reference point (a window's start rather than when a
+   window with enough in-incident data actually closed), silently
+   floor-clamping 21 of 22 sweep points to a meaningless `0.0s`. After
+   the fix: a real distribution of 0.8s-22.1s.
+5. **Phase 6** — this phase's own ramp harness, detailed above.
+
+**The pattern across all five: the systems under test were mostly
+correct on the first real attempt; the code measuring them was not,**
+and needed to be interrogated and fixed repeatedly before its output
+could be trusted. None of these were caught by unit tests — every one
+surfaced only once real, live data was measured and the *result*
+looked implausible enough to go dig into why (a 39% late-span rate on
+a clean run; three identical configs producing three different
+numbers; 21 of 22 points landing on exactly the same suspicious value;
+a 500 spans/sec "failure" with every other signal healthy). The
+practical lesson this project keeps re-learning: an implausible result
+is usually telling you something is wrong with how you're measuring,
+not with the thing you're measuring — and the only way to find out
+which is to go look, not to trust either the first green run or the
+first red one.
+
+### Failure definition
+
+A ramp step **fails** if, over its own held window, the rate the
+writer actually consumed and durably inserted falls more than 2%
+short of the rate the collector actually published to Kafka — i.e.
+the writer visibly falling behind its own upstream, confirmed with one
+immediate re-run before being accepted (see "Measurement reliability"
+above for why). Span loss, end-to-end latency, and container
+restarts/OOM are recorded at every step as supporting evidence, not as
+independent triggers.
+
+### Ramp to failure
+
+`scripts/run_load_test.sh ramp 120 <rates...>`, 120s held per step,
+clean ClickHouse state at the start of the ramp. Full per-step
+records: `scripts/load_test_results/ramp-1785992394.jsonl` (100
+through 5,000) and `scripts/load_test_results/ramp-1785993646.jsonl`
+(10,000 through 80,000 — a continuation of the same ramp after the
+5,000 spans/sec ambiguity was resolved, see the variance note below).
+
+| Offered (spans/sec) | Published | Consumed | Result |
+|---|---|---|---|
+| 100 | 98.2/s | 98.9/s | stable |
+| 500 | 481.4/s | 484.7/s | stable |
+| 1,000 | 984.6/s | 1016.8/s | stable |
+| 2,500 | 2,409.7/s | 2,446.1/s | stable |
+| 5,000 | ~4,850/s avg across 5 runs | ratio 0.963-1.011 | stable — see the variance note below |
+| 10,000 | 9,502.1/s | 9,559.1/s | stable |
+| 20,000 | 19,414.1/s | 19,434.6/s | stable — but see the analyzer finding below |
+| 40,000 | — | — | **collapse**: 705,799 of ~1.41M attempted sends failed (~50%) |
+| 80,000 | 0/s | 0/s | **total failure**: 0 of 1,357,893 attempted sends succeeded |
+
+**5,000 spans/sec run-to-run variance:** 5 total observations (1 from
+each of 2 full ramp attempts, 3 dedicated repeats) — 1 marginal fail
+(consumed/published ratio 0.963), 4 clean passes (0.998-1.011). No
+resource anywhere near saturated in any of the 5. This is measurement
+noise around a genuinely stable rate, not a real ceiling — see
+"Measurement reliability" above. **The breaking point does not sit at
+5,000**; it sits between 20,000 and 40,000, characterized below.
+
+### The breaking point, traced through container state and logs
+
+The write path (collector → Kafka → writer → ClickHouse) holds cleanly
+through 20,000 spans/sec — published and consumed rates track each
+other within a fraction of a percent the entire way, every latency and
+error metric flat. Between 20,000 and 40,000 it collapses completely,
+and the 80,000 step (0% success, and taking 8 minutes of wall clock
+instead of its intended 2) shows the collapse compounding rather than
+recovering.
+
+**Root cause, confirmed directly from container state, not inferred:**
+
+1. `docker inspect deploy-redpanda-1` at the moment of collapse:
+   `Exited (133)`, `OOMKilled: false`. Its own log at that exact
+   timestamp: `ERROR ... seastar - Failed to allocate 32768 bytes.
+   Aborting on shard 3.` Redpanda's own seastar engine exhausted its
+   2GB `mem_limit` and aborted itself — a hard internal crash, not the
+   Linux kernel's OOM killer.
+2. With the broker gone, the collector's Kafka producer could no
+   longer drain messages it had already accepted; its logs show a wall
+   of `"kafka producer in-flight buffer full"` warnings starting at
+   the exact same timestamp. That in-flight buffer is correctly
+   bounded on its own terms (`kafkaproducer.Producer`'s semaphore, see
+   `docs/DECISIONS.md`) — but nothing bounded how many *concurrent
+   OTLP Export requests* the collector would accept and hold in memory
+   while their spans failed one by one. `docker_stats_peak_during_step`
+   shows the collector's memory at 99.95% of its 512MB limit
+   immediately before `docker inspect deploy-collector-1` confirms
+   `OOMKilled: true, ExitCode: 137`.
+3. Neither service came back — `docker-compose.yml` set no restart
+   policy on any service (fixed since, see `docs/DECISIONS.md` and
+   `docs/ISSUES.md`). The pipeline stayed fully down until manually
+   restored.
+
+**A second, independent, earlier breaking point:** `docker inspect
+deploy-analyzer-1` shows `OOMKilled: true` at a timestamp landing
+mid-way through a *different*, earlier ramp attempt's 20,000 spans/sec
+step — one where the write path itself was completely healthy at that
+moment. The analyzer holds an entire window's worth of spans in
+Python-process memory to reassemble and aggregate; Python's per-object
+overhead is far higher than the Go services on the write path, and its
+own 512MB limit was exhausted by span volume alone, independent of
+anything happening downstream. **The system has two different
+breaking points depending on which capability is being asked about:**
+raw ingest holds past 20,000 and gives out between 20,000-40,000;
+analysis (reassembly, detection) already fails at or before 20,000 —
+a materially lower number, and the one that matters if "the system
+works" is read to include anything beyond durable storage.
+
+**Available fix not taken, and why:** raising redpanda's and/or the
+collector's memory limit would very likely push this specific collapse
+to some higher offered rate. It was deliberately not done — see
+`docs/DECISIONS.md` for the reasoning — in favor of giving the
+collector its own independent concurrency bound, decoupled from
+whatever memory happens to be configured. The tuning result against
+that fix is below.

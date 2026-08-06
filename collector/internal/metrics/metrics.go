@@ -13,6 +13,8 @@ type Collector struct {
 	PublishErrors    *prometheus.CounterVec
 	PublishDuration  prometheus.Histogram
 	InflightMessages prometheus.Gauge
+	RequestsRejected prometheus.Counter
+	InflightRequests prometheus.Gauge
 }
 
 // New registers the collector's metrics against reg and returns them.
@@ -42,6 +44,14 @@ func New(reg prometheus.Registerer) *Collector {
 		InflightMessages: f.NewGauge(prometheus.GaugeOpts{
 			Name: "collector_inflight_messages",
 			Help: "Spans produced to Kafka but not yet acked or failed.",
+		}),
+		RequestsRejected: f.NewCounter(prometheus.CounterOpts{
+			Name: "collector_requests_rejected_total",
+			Help: "Total OTLP Export requests rejected outright at admission, before any span in them was processed, because collector_max_concurrent_exports was already reached.",
+		}),
+		InflightRequests: f.NewGauge(prometheus.GaugeOpts{
+			Name: "collector_inflight_requests",
+			Help: "OTLP Export requests currently being processed, admitted but not yet returned.",
 		}),
 	}
 }

@@ -1185,13 +1185,56 @@ fails at or before 20,000 — a materially lower number, and the one
 that actually matters if "the system works" is read to include trace
 reassembly and detection, not just durable storage.
 
-**Not fixed as of this ramp — reported as found, root-caused, and
-reproducible.** The proximate trigger (redpanda's 2GB memory limit
-being too tight for sustained throughput in this range) and the
-secondary amplifier (the collector's unbounded in-flight buffer with
-no backpressure to its own upstream once the broker is unreachable)
-are two independently addressable things, and which one is worth
-tuning first — and by how much — is exactly what this phase's
-bottleneck-and-tuning deliverable exists to determine, not something
-to guess at here. See docs/BENCHMARKS.md for the full ramp table this
-was measured against.
+**Two independently addressable things, and the one actually fixed.**
+The proximate trigger (redpanda's 2GB memory limit being too tight for
+sustained throughput in this range) and the secondary amplifier (the
+collector piling up unbounded memory once its downstream broker
+became unreachable) are two different problems in two different
+services. Raising redpanda's memory limit was available and
+deliberately not chosen — see docs/DECISIONS.md for why relocating the
+cliff isn't the same as fixing it. The collector-side amplifier was
+fixed; see the next entry for the precise mechanism, once actually
+traced through the code rather than described only at the "unbounded
+buffer" level above.
+
+### The collector's actual gap wasn't the Kafka buffer — it was that nothing bounded concurrent requests at all
+
+**Following up on the entry above.** `kafkaproducer.Producer` already
+has exactly the right shape of fix for its own layer — Phase 1 gave it
+a bounded, non-blocking semaphore (`inflight chan struct{}`) so a slow
+or unavailable broker can't make `PublishSpan` pile up unbounded
+Kafka-related state. That protection worked exactly as designed during
+the collapse: once the semaphore filled, every further `PublishSpan`
+call took the immediate `ErrBufferFull` fast-reject path (the wall of
+`"kafka producer in-flight buffer full"` log lines), correctly bounded
+on its own terms.
+
+**What that bound never covered:** `otlpreceiver.Receiver.Export`
+calls `PublishSpan` once per span in the incoming request and keeps
+going even after `bufferFull` becomes true, and — more importantly —
+`grpc.NewServer()` in `cmd/collector/main.go` was constructed with no
+options at all: no cap on concurrent RPCs, no admission control of any
+kind. With redpanda gone and every `PublishSpan` call now returning
+instantly (the fast-reject path is *fast*), Export requests themselves
+weren't the bottleneck — but nothing stopped an unbounded number of
+them from being concurrently in flight, each one a fully-decoded
+`ExportTraceServiceRequest` (potentially many spans, from however many
+of the load generator's parallel processes happened to be connected at
+once) sitting in memory for the duration of its own handling. That
+concurrent-request memory, not the well-bounded Kafka path, is what
+grew until the collector's own 512MB limit was exhausted.
+
+**Fix:** `collector/internal/admission` — a `grpc.UnaryServerInterceptor`
+scoped specifically to the `TraceService/Export` method (health checks
+and reflection stay responsive even while Export is being throttled,
+so a still-alive-but-shedding-load process is distinguishable from a
+hung one) that admits at most `COLLECTOR_MAX_CONCURRENT_EXPORTS`
+(default 256) concurrent calls, rejecting anything beyond that
+immediately with `ResourceExhausted` and a counted
+`collector_requests_rejected_total` metric — before the rejected
+request's spans are ever touched, mirroring `kafkaproducer.Producer`'s
+own bounded-semaphore, fail-fast-and-visibly pattern at the layer
+above it. This bound holds regardless of whether Kafka is reachable,
+which is exactly the property the old one was missing. Re-run result
+(one variable changed, same 40,000 spans/sec offered rate) is in
+docs/BENCHMARKS.md.
