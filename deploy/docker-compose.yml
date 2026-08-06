@@ -8,6 +8,7 @@ services:
       - --node-id=0
       - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
       - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    restart: unless-stopped
     ports:
       - "19092:19092"
     healthcheck:
@@ -37,6 +38,7 @@ services:
       # The official image restricts the "default" user to localhost unless
       # a password is set, which would block the writer's remote connection.
       CLICKHOUSE_PASSWORD: "tracing-dev"
+    restart: unless-stopped
     volumes:
       - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
@@ -55,6 +57,7 @@ services:
       COLLECTOR_HTTP_ADDR: ":4318"
       KAFKA_BROKERS: "redpanda:9092"
       KAFKA_TOPIC: "spans"
+    restart: unless-stopped
     ports:
       - "4317:4317"
       - "4318:4318"
@@ -77,6 +80,7 @@ services:
       CLICKHOUSE_DB: "tracing"
       CLICKHOUSE_USER: "default"
       CLICKHOUSE_PASSWORD: "tracing-dev"
+    restart: unless-stopped
     ports:
       - "8080:8080"
     depends_on:
@@ -100,6 +104,7 @@ services:
       CLICKHOUSE_DB: "tracing"
       CLICKHOUSE_USER: "default"
       CLICKHOUSE_PASSWORD: "tracing-dev"
+    restart: unless-stopped
     ports:
       - "9464:9464"
     depends_on:
@@ -127,6 +132,7 @@ services:
       CLICKHOUSE_PASSWORD: "tracing-dev"
       API_MAX_ROWS: "500"
       API_MAX_TIME_RANGE_SECONDS: "86400"
+    restart: unless-stopped
     ports:
       - "8000:8000"
     depends_on:
@@ -140,6 +146,7 @@ services:
 
   prometheus:
     image: prom/prometheus:v2.53.0
+    restart: unless-stopped
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
@@ -164,6 +171,7 @@ services:
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+    restart: unless-stopped
     ports:
       - "3000:3000"
     depends_on:
