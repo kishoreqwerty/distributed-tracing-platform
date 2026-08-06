@@ -939,3 +939,92 @@ other side's author never had reason to read while writing against the
 client function's own already-plausible-sounding signature. Neither
 `schemas.py` nor `dashboard/src/api/types.ts` encodes "root service
 only" in a way a reader skimming the TypeScript alone would catch.
+
+## Phase 6 (harness: load generator ceiling, metric-window dilution)
+
+### A single loadgen process can't honestly offer this phase's higher ramp rates — found before the ramp itself ran
+
+**Symptom, found during harness calibration, not during a real ramp
+step:** a 15-second burst at `--rate 1000` (traces/sec) reported
+`traces_generated: 8630` in one trial — 57.5% of the 15,000 the ticker
+should have fired at that rate over that duration — and a repeat of
+the identical invocation reported `12319` (82.1%) instead, a
+meaningfully different result from literally the same command run
+seconds apart. A burst at `--rate 3600` reported `29451` (54.6% of
+expected) and, for the first time in this project's history of running
+loadgen, real `send failed` errors: `kafka publish buffer full, retry
+later`, 711 of them.
+
+**Root cause:** `main.go`'s generation loop is a single
+`time.Ticker`-driven goroutine — one `cfg.Generate(rng)` call (protobuf
+struct construction, several RNG draws) per tick, dispatching the
+actual network send to its own goroutine so the loop itself isn't
+blocked on I/O. Go's `time.Ticker` holds at most one buffered tick: if
+processing one iteration takes longer than the requested interval, the
+next tick is dropped rather than queued, and the achieved rate silently
+falls below the requested one with no error, warning, or nonzero exit
+code — the process reports success and a `traces_generated` count that
+just happens to be lower than `rate * duration`. Measured efficiency
+against repeated 15s calibration bursts: ~100% at 90-450 traces/sec,
+98.9% at 700, 96.5% at 800, 89.2% at 900, and an inconsistent 55-82% at
+1000+ across repeated identical trials — the last of these being large
+enough run-to-run variance on its own to distrust any single
+high-rate data point.
+
+**Why this had to be caught before the real ramp, not during it:** the
+phase's own suggested steps go up to 20,000 spans/sec (~3,597
+traces/sec at this topology's spans/trace ratio — see
+docs/DECISIONS.md). Every one of the ramp's higher steps sits well past
+where a single process's own throughput ceiling was already found to
+bite. Trusting `--rate` as ground truth for "offered load" at those
+steps would have measured the load generator's own scheduling limits,
+not the collector/Kafka/writer/ClickHouse pipeline's — exactly the
+"if the harness is wrong, everything measured with it is wrong"
+failure this phase's build order is explicitly structured to catch
+before the ramp runs for real.
+
+**Fix:** the harness (`scripts/run_load_test.sh`) never trusts the
+requested rate above ~600 traces/sec per process. Above that, it fans
+out into multiple parallel loadgen containers, each kept within its
+own reliable envelope, and computes the step's true offered/achieved
+rate from the *sum of every process's own reported*
+`traces_generated`/`spans_generated`/`sent_spans` after the fact — not
+from what was asked for. No change to loadgen itself: the ticker-loop
+design is a reasonable choice for the moderate rates this project's
+other phases actually needed (a fault/incident sweep tops out around
+100 traces/sec), and rewriting it into something more throughput-
+optimized (worker-pool generation, sharded tickers) is real, separate
+engineering this phase doesn't need in order to still honestly *offer*
+a high rate — using several of the existing, already-correct process
+is cheaper and doesn't add a new thing that itself needs validating
+under load.
+
+### The harness's own Prometheus rate window diluted short steps' measured throughput
+
+**Symptom:** the first working version of the harness ran a step
+offering ~500 spans/sec for 20 seconds and read back
+`rate(collector_spans_received_total[1m])` as 227/sec — less than half
+the real rate, on a step where the loadgen's own summary log confirmed
+~499 spans/sec were actually generated and sent.
+
+**Root cause:** every `rate()`/`histogram_quantile()` query used a
+fixed `1m` lookback window regardless of how long the step being
+measured actually ran. For a 20-second step, that window's other 40
+seconds cover idle time from before the step started, and Prometheus's
+`rate()` averages a counter's increase across the *entire* window, not
+just the part with real traffic — a short, high-rate step reads back
+diluted toward whatever the window's idle fraction happens to be. This
+would have been invisible on the phase's real ramp steps (each held
+120s+, comfortably wider than a 1m window) but would have quietly
+undermeasured anything shorter — including, critically, the
+calibration and any quick single-step sanity check exactly like the
+one that caught it.
+
+**Fix:** the snapshot query's window is now tied to the step's own
+`duration_seconds`, clamped to `[15s, 120s]` — wide enough to span a
+few scrape intervals even on a very short step, capped so a 30-minute
+soak's periodic snapshots stay both cheap to query and reasonably
+local to "now" rather than averaging across the entire soak every
+time. Re-verified against the same 500 spans/sec, 20s step: the
+received-rate reading moved to 439.7/sec, in line with what was
+actually generated.

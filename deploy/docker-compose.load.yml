@@ -1,0 +1,134 @@
+# Resource limits for Phase 6 load testing. Layered on top of
+# docker-compose.yml (and, for a fast per-window turnaround, usually
+# docker-compose.eval.yml too):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.eval.yml \
+#     -f docker-compose.load.yml up -d --build
+#
+# Why this file exists at all: the base compose file has never bounded
+# any service's CPU or memory. On a shared laptop that means a service
+# under real load borrows from whatever's idle elsewhere (including the
+# load generator itself, which runs as its own set of containers outside
+# this compose project) — a run's results would depend on exactly what
+# else happened to be idle at the time, which is not reproducible and
+# not something a later re-run can be checked against. Explicit limits
+# turn "however much RAM happened to be free" into a fixed, documented
+# budget every run shares identically.
+#
+# Docker Desktop on this machine is allocated 15 CPUs / 7.75GiB RAM (see
+# docs/BENCHMARKS.md's Phase 6 environment section) — that ceiling, not
+# the host's full 24GB/15-core spec, is the real budget every limit
+# below is sized against.
+#
+# Memory is the tighter constraint here, not CPU: the limits below sum
+# to 7.0GiB of an available 7.75GiB, leaving ~0.75GiB (~10%) headroom
+# for the Docker Desktop VM's own daemon/overhead — memory limits are
+# hard (a container that exceeds its `mem_limit` gets OOM-killed, not
+# throttled), so this headroom is load-bearing, not a rounding
+# nicety. CPU limits below sum to 10.75 of 15 cores *deliberately*
+# leaving ~4.25 cores unclaimed — not slack, but reserved for the load
+# generator itself. Calibration (docs/BENCHMARKS.md, docs/ISSUES.md)
+# found a single loadgen process can't sustain this phase's higher
+# ramp steps on its own (its ticker-driven generation loop's own
+# throughput ceiling is reached well before the pipeline's), so the
+# harness runs several loadgen containers in parallel to reach a given
+# offered rate — those containers need real CPU too, and if the
+# pipeline's own limits claimed all 15 cores, the load generator would
+# be starved by the very compose stack it's supposed to be loading,
+# confounding every result with "was the pipeline slow, or was the
+# generator too CPU-starved to offer the intended rate?"
+#
+# Per-service rationale:
+#   redpanda    3 CPU / 2GiB   — highest idle CPU draw of any service
+#                                 observed even between bursts (~38% of
+#                                 a core post-burst, background
+#                                 compaction), and the first hop every
+#                                 span passes through under load.
+#   clickhouse  3 CPU / 2.5GiB — insert + background merge both want
+#                                 real CPU under sustained write load;
+#                                 gets the largest memory share since
+#                                 merge activity is the most plausible
+#                                 memory-growth risk this phase's soak
+#                                 (deliverable 5) is specifically
+#                                 watching for.
+#   collector   1.5 CPU / 512MiB — thin OTLP-to-Kafka relay, CPU-bound
+#                                 on protobuf decode + Kafka produce
+#                                 under load, not memory-hungry.
+#   writer      1.5 CPU / 512MiB — same shape as collector; batch
+#                                 buffering (up to 5000 rows) is the
+#                                 only real memory user, comfortably
+#                                 under 512MiB even at the max batch
+#                                 size.
+#   analyzer    0.5 CPU / 512MiB — off the hot path entirely (polls on
+#                                 its own cadence, doesn't touch
+#                                 in-flight spans); given enough to
+#                                 avoid becoming a false bottleneck
+#                                 nobody actually cares about this
+#                                 phase.
+#   analyzer-api 0.25 CPU / 256MiB — unused during load generation
+#                                 itself; kept alive and bounded only
+#                                 so it doesn't get OOM-killed by
+#                                 accident.
+#   prometheus  0.75 CPU / 512MiB — scrape interval is tightened for
+#                                 this phase (see prometheus-load.yml),
+#                                 raising sample ingestion rate and
+#                                 short-term time-series memory versus
+#                                 the default profile.
+#   grafana     0.25 CPU / 256MiB — dashboard rendering only, no
+#                                 write path.
+#
+# These are starting points, not tuned values — deliberately chosen
+# from reasoning about each service's role, the way docs/DECISIONS.md's
+# existing entries work, rather than profiled first. If the ramp shows
+# a service hitting *its own limit* rather than a genuine architectural
+# ceiling, that's a real risk worth naming up front: docs/BENCHMARKS.md
+# states explicitly, for every reported bottleneck, whether the ceiling
+# hit was one of these configured limits or a resource that was still
+# below its cap when the metric flattened — only the latter is a
+# genuine finding about the system, not about this file's numbers.
+
+services:
+  redpanda:
+    cpus: 3.0
+    mem_limit: 2g
+
+  clickhouse:
+    cpus: 3.0
+    mem_limit: 2.5g
+    volumes:
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./clickhouse/prometheus-metrics.xml:/etc/clickhouse-server/config.d/prometheus-metrics.xml:ro
+    # docker compose replaces (not merges) a service's ports/volumes
+    # list when the same key is set in an override file — both of the
+    # base file's port mappings are repeated here so this override
+    # doesn't silently drop them, plus the new Prometheus metrics port.
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+      - "9363:9363"
+
+  collector:
+    cpus: 1.5
+    mem_limit: 512m
+
+  writer:
+    cpus: 1.5
+    mem_limit: 512m
+
+  analyzer:
+    cpus: 0.5
+    mem_limit: 512m
+
+  analyzer-api:
+    cpus: 0.25
+    mem_limit: 256m
+
+  prometheus:
+    cpus: 0.75
+    mem_limit: 512m
+    volumes:
+      - ./prometheus/prometheus-load.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    cpus: 0.25
+    mem_limit: 256m

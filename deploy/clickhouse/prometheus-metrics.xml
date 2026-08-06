@@ -1,0 +1,18 @@
+<!--
+  ClickHouse ships this block in its default config.xml, but commented
+  out. Phase 6 needs insert latency, memory, and merge activity in
+  Prometheus/Grafana alongside the collector/writer/analyzer metrics
+  that already exist — this config.d override turns it on without
+  touching the stock image's own config.xml. Only mounted by
+  docker-compose.load.yml; the default profile doesn't scrape
+  ClickHouse and doesn't need this endpoint running.
+-->
+<clickhouse>
+    <prometheus>
+        <endpoint>/metrics</endpoint>
+        <port>9363</port>
+        <metrics>true</metrics>
+        <events>true</events>
+        <asynchronous_metrics>true</asynchronous_metrics>
+    </prometheus>
+</clickhouse>

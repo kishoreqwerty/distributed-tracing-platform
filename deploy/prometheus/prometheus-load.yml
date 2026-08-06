@@ -1,0 +1,34 @@
+# Load-testing scrape config — only differs from prometheus.yml in its
+# scrape_interval (5s vs. the default profile's 15s). A ramp step is
+# held for as little as 2 minutes; at 15s scrape intervals that's only
+# 8 samples per step, not enough resolution to see *when* within a step
+# a metric started climbing, or to catch a short-lived spike between
+# scrapes entirely. 5s gives 24 samples per 2-minute step and is what
+# makes "capture the moment of failure" (a lag graph going vertical)
+# actually legible rather than a slope drawn through 8 points. Not used
+# outside Phase 6: the tighter interval means more stored samples for
+# the same retention window, which isn't a cost worth paying for the
+# default profile's own, much lower-frequency needs.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: collector
+    static_configs:
+      - targets: ["collector:4318"]
+
+  - job_name: writer
+    static_configs:
+      - targets: ["writer:8080"]
+
+  - job_name: analyzer
+    static_configs:
+      - targets: ["analyzer:9464"]
+
+  # Only scraped in this load-testing profile — ClickHouse's built-in
+  # Prometheus exporter is off by default (see
+  # deploy/clickhouse/prometheus-metrics.xml) and only mounted by
+  # docker-compose.load.yml.
+  - job_name: clickhouse
+    static_configs:
+      - targets: ["clickhouse:9363"]
