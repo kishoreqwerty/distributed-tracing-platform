@@ -1238,3 +1238,58 @@ above it. This bound holds regardless of whether Kafka is reachable,
 which is exactly the property the old one was missing. Re-run result
 (one variable changed, same 40,000 spans/sec offered rate) is in
 docs/BENCHMARKS.md.
+
+### Redpanda aborted at 26% of its configured memory limit — the container limit and the effective per-shard limit are different things
+
+**Symptom:** across two separate 40,000 spans/sec runs, redpanda
+aborted with `seastar - Failed to allocate 32768 bytes. Aborting on
+shard 3` while `docker stats` showed its memory at only 26-39% of the
+2GB `mem_limit` configured in `deploy/docker-compose.load.yml` — nowhere
+close to the container's own ceiling.
+
+**Confirmed mechanism, read directly from redpanda's own startup log,
+not inferred:**
+
+```
+System resources: { cpus: 15, available memory: 1.934GiB, reserved memory: 0.000bytes}
+```
+
+Seastar (redpanda's underlying framework) is shard-per-core: at
+startup it partitions its total memory budget evenly across one shard
+per *visible* CPU, and each shard's allocator only ever draws from its
+own slice — a shard that exhausts its own slice aborts, regardless of
+how much memory any *other* shard still has free. `docker exec
+deploy-redpanda-1 nproc` reports **15** — Docker's `cpus: 3.0` setting
+in the compose override is a cgroup CPU-*time* quota (it throttles how
+much CPU the container gets scheduled), not a reduction in how many
+CPUs the container's kernel view reports, and redpanda's
+`--overprovisioned` startup flag (visible in its own launch command)
+means it auto-detects shard count from that visible CPU count rather
+than being told an explicit `--smp` value. So: **15 shards, 1.934GiB
+total → roughly 129MB per shard** — not 2GB. The crash log's own
+`shard 3` is consistent with this: work isn't required to spread evenly
+across all 15 shards, and Kafka/Redpanda's per-partition leadership
+model concentrates produce load onto however many shards actually hold
+a leader replica for the topic in question (`rpk topic describe spans
+-p` shows all 4 of this topic's partitions led from the same
+broker/shard-affinity group) — a small number of shards doing real
+work, each with only ~129MB, while the other ~11 sit close to idle and
+never come near exhausting their own share.
+
+**Not fixed — this entry exists to document the mechanism, per its own
+request, not to claim a resolution.** The practical implication: a
+"2GB memory limit" on a redpanda container is not a 2GB ceiling on how
+much sustained produce load it can absorb — the effective ceiling is
+closer to (memory ÷ visible CPU count) × (however many shards actually
+carry this workload's traffic), which on this specific machine (15
+visible CPUs inside a container cgroup-limited to 3 of them) is far
+smaller than the configured `mem_limit` would suggest at a glance.
+Two independent levers exist to close this gap, neither exercised
+here: pin the container to fewer *visible* CPUs (`cpuset`, not just a
+CPU-time quota, so seastar's own auto-detection sees fewer cores and
+creates fewer, larger shards) or pass redpanda an explicit `--smp`
+flag capping shard count directly, decoupled from whatever the
+container's kernel view of available CPUs happens to be. Either would
+need its own re-run to confirm before trusting it, which this entry
+deliberately doesn't do — recorded as a confirmed mechanism and an
+available-but-untaken next step, not a fix.
