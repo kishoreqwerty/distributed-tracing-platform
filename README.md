@@ -52,6 +52,14 @@ correctness could be measured against ground truth rather than assumed.
    root-cause accuracy. This is the harness behind every number in
    `docs/BENCHMARKS.md` — nothing in this README or that file is
    invented or estimated.
+6. **`scripts/run_load_test.sh`** drives `loadgen` at sustained rates
+   well past what any single process can honestly generate alone (it
+   fans out into several parallel processes once a target rate exceeds
+   one process's own calibrated ceiling), records structured
+   before/during/after metrics per step, and enforces a single,
+   precisely-defined failure condition rather than eyeballing a graph.
+   This is what found this project's actual breaking point — see the
+   "Load test" results below and `docs/BENCHMARKS.md`'s full account.
 
 ## Architecture
 
@@ -141,6 +149,26 @@ pipeline test, not in CI — needs Docker); `cd dashboard && npm test`
 scripts used to produce every number below, are in
 `docs/ARCHITECTURE.md`'s "Running locally" section.
 
+```sh
+cd deploy
+docker compose -f docker-compose.yml -f docker-compose.eval.yml \
+  -f docker-compose.load.yml up -d --build
+docker build -t deploy-loadgen:latest -f ../loadgen/Dockerfile ../loadgen
+
+cd ..
+./scripts/run_load_test.sh clean                       # wipe to a known baseline first
+./scripts/run_load_test.sh ramp 120 100 500 1000 2500 5000 10000 20000
+./scripts/run_load_test.sh single 5000 300 my-test-label  # one fixed rate, held
+```
+
+Load-testing profile: pins per-service CPU/memory (see
+`deploy/docker-compose.load.yml` for the exact limits and why), scrapes
+5s instead of 15s, and enables ClickHouse's own Prometheus exporter.
+Grafana's provisioned "Phase 6 — Load Test" dashboard picks this up
+automatically at `http://localhost:3000`. **Read the co-location
+caveat before trusting any number this produces** — see "Load test"
+under Results, below.
+
 ## Results
 
 Every number below is measured, from `docs/BENCHMARKS.md`, which has
@@ -177,6 +205,59 @@ invented.
   project's current data volume, `/api/traces` being the slower
   outlier because of its Python-side duration-filter compromise (see
   below).
+
+### Load test (Phase 6) — read the conditions, not just the number
+
+**Everything in this section ran co-located on one laptop** — every
+service plus the load generator sharing one machine's CPU, memory,
+disk, and loopback network (Apple M5 Pro, 15 cores, Docker Desktop
+allocated 15 CPU / 7.75GiB RAM — see `docs/BENCHMARKS.md`'s Phase 6
+environment table for the full spec and per-service resource limits).
+**This is not a production benchmark and none of the numbers below
+should be read as one** — they measure *relative* behavior on this one
+box (what saturates first, how the system degrades), not an absolute
+ceiling that would hold on real, distributed hardware.
+
+There is no single honest headline number, because short-burst
+tolerance and sustained tolerance turned out to be different claims:
+
+- **The write path (collector → Kafka → writer → ClickHouse) holds
+  cleanly through 20,000 spans/sec in 2-minute ramp steps**, and
+  collapses completely between 20,000 and 40,000 — redpanda's own
+  `seastar` memory allocator aborts under its 2GB limit (root-caused to
+  a per-shard memory split: 15 visible CPU cores inside a
+  cgroup-limited-to-3 container means redpanda auto-detects 15 shards
+  and splits its budget into ~129MB slices, not one 2GB pool — see
+  `docs/ISSUES.md`), which cascaded into the collector being OOM-killed
+  before a fix. **A 30-minute soak at 28,000 spans/sec (70% of that
+  40,000 failure point) revealed the 2-minute ramp result was
+  optimistic for sustained load**: the pipeline was completely down —
+  zero spans published, zero consumed — for 20 of the 30 minutes,
+  redpanda restarting 8 times. This system's real, sustainable ceiling
+  is meaningfully lower than the short-burst ramp alone suggested, and
+  wasn't pinned down further — a rate that comfortably passes a
+  2-minute test is not the same claim as a rate that survives 30.
+- **The one tuning change made (bounding the collector's own concurrent
+  request admission, independent of the Kafka producer's existing
+  bound) worked exactly as intended**: re-running the 40,000 spans/sec
+  collapse with only that one variable changed, the collector never
+  crashed (peak memory 4.8% of its limit, versus 99.95% before) and
+  successful throughput rose 4x (707,521 to 2,998,361 sends). Redpanda
+  still crashed on schedule — that variable was deliberately left
+  untouched, and still crashing confirms the experiment isolated the
+  right thing rather than accidentally fixing something else.
+- **Recovery behavior split cleanly along one line: components with a
+  bounded way to shed load recovered, one without didn't.** A writer
+  restart mid-load lost zero spans and rebalanced cleanly. Throttling
+  ClickHouse's CPU to under 7% of normal (not killing it) caused real,
+  visible degradation — flush duration up 10-100x — but zero data loss
+  and immediate full recovery once restored, directly contradicting
+  this phase's own working assumption that partial degradation would
+  behave worse than a clean outage. Redpanda, by contrast, got stuck
+  permanently `unhealthy` after one overload cycle — the process
+  restarted, the service never came back on its own, and the only
+  recovery observed was a full manual restart. See `docs/BENCHMARKS.md`
+  for the complete evidence behind every number above.
 
 ## Known limitations
 
@@ -229,11 +310,32 @@ finding, not a hypothetical:
   "baselines are still warming up" without new backend detection logic
   this phase doesn't add — the UI says so directly rather than
   implying health. See `docs/ARCHITECTURE.md`'s "Dashboard" section.
-- **No load testing has been done.** Every latency number in this
-  README and in `docs/BENCHMARKS.md`'s Phase 4 section is a
-  single-client, single-request measurement against this project's
-  current (modest) data volume — sustained-throughput and
-  concurrent-load characterization is Phase 6, not yet built.
+- **The dashboard's own API latency (Phase 4 section above) is still
+  only single-request** — Phase 6 characterizes the ingest pipeline's
+  load behavior, not the query API's, which remains untested under
+  concurrent dashboard traffic.
+- **The system's real, sustainable capacity ceiling is not pinned
+  down.** Phase 6's 2-minute ramp steps found the write path stable
+  through 20,000 spans/sec; a 30-minute soak at 28,000 (70% of the
+  ramp's own 40,000 failure point) showed the pipeline down for 20 of
+  30 minutes. The actual sustained-safe rate is somewhere at or below
+  20,000, itself never confirmed stable for longer than 2 minutes — a
+  known gap, not a number this project has, stated as such rather than
+  guessed at.
+- **Redpanda's crash-recovery is unreliable in a way process restarts
+  can't fix.** After one overload cycle, redpanda got stuck
+  permanently `unhealthy` — the container process came back (Docker's
+  restart policy did its job), but the service itself never did,
+  observed for 5+ minutes and still broken a minute after the test
+  ended. `restart: unless-stopped` only acts on process exit, not
+  service health, and nothing in this stack currently distinguishes
+  the two. See `docs/BENCHMARKS.md`'s Phase 6 recovery section.
+- **cAdvisor doesn't work on this Docker Desktop version** (a real,
+  diagnosed incompatibility with its containerd-snapshotter storage
+  backend, not a misconfiguration), so the load-test Grafana dashboard
+  has no live per-container CPU/memory panel — that data still exists,
+  captured directly by the load harness into per-run result files, just
+  not as a continuous time series. See `docs/ISSUES.md`.
 
 Full reasoning behind every non-obvious decision (not just the ones
 above) is in `docs/DECISIONS.md`; every bug actually hit during
