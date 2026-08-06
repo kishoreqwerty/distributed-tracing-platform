@@ -913,3 +913,69 @@ zero for the remaining 28 minutes — a less informative result than
 what actually happened, where repeated auto-recovery let real
 (if degraded, ~40% successful) throughput continue intermittently and
 made the true failure *rate*, not just its existence, measurable.
+
+### Recovery: overload then drop to a known-good rate
+
+**Does the system recover on its own once the overload stops?
+Observed answer: not within 5+ minutes, and not on its own at all.**
+90s at 40,000 spans/sec (the ramp's own confirmed failure point),
+immediately followed by 300s at 5,000 spans/sec — a rate independently
+confirmed stable across 5 separate observations earlier in this phase.
+`scripts/recovery_monitor.sh` sampled every 15s throughout;
+`scripts/load_test_results/overload_recover_timeline.jsonl` has every
+sample.
+
+| Elapsed | Published/sec | Consumed/sec | Lag (total) |
+|---|---|---|---|
+| 15s | 20,221 | 23,352 | 3,885 |
+| 30s | 23,180 | 21,172 | 0 |
+| 45s | 15,464 | 17,319 | 5,503 |
+| 75s | 38,421 | 39,333 | 2,115 |
+| 90s (overload ends) | 0 | 4,666 | 2,115 |
+| 105s (recovery starts) | 0 | 0 | 2,115 |
+| 120s through 420s | **0** | **0** | **2,115** (unchanged) |
+
+The overload phase itself was not an immediate wipeout — the first 75
+seconds show real, substantial throughput with lag actually draining
+to zero once (at 30s), consistent with the ramp's own 40,000
+spans/sec step (~50% success, not 0%). Somewhere around 90s in,
+redpanda crashed; the recovery phase that followed — at a rate this
+phase confirmed stable five separate times — never processed a single
+span. Lag froze at exactly 2,115 for the remaining 5+ minutes because
+nothing was moving on either side of it to change it, the same
+frozen-gauge signature as the soak.
+
+**Root cause: the restart-policy fix brought the process back, not
+the cluster.** `docker inspect deploy-redpanda-1 --format
+'{{.RestartCount}}'` showed 3 restarts during this test; the container
+was `Running: true` throughout the "dead" window, not crash-looping.
+But `docker inspect ... --format '{{json .State.Health}}'` showed
+`Status: unhealthy` with a `FailingStreak` that kept climbing (40,
+then 43 checked a minute apart) — and `rpk cluster health` reported
+`Healthy: false, Unhealthy reasons: [no_health_report]` on a
+single-node cluster that should never need to ask another node for
+its own health. Redpanda's own logs explain why: `unable to get health
+report - Timeout occurred while processing request` and `timed out
+when refreshing cluster health state`, repeating indefinitely — the
+node's internal health-monitoring subsystem was timing out talking to
+itself, likely a symptom of the same per-shard resource exhaustion
+already confirmed above (a shard too starved to service its own
+internal health RPCs is also too starved to service produce
+requests). **This state does not self-heal.** Still `unhealthy`,
+`FailingStreak` still climbing, when checked again a full minute after
+the test ended — the only way out observed was a full container
+recreation, not a wait.
+
+**What this means for "does it recover":** the honest answer has two
+parts, not one. The *process* recovers — `restart: unless-stopped`
+does exactly what it's for, and without it this test would have ended
+in a permanent outage at 90s instead of a container that's merely
+useless. But **process-alive is not the same claim as
+service-healthy**, and nothing in this stack currently distinguishes
+the two or attempts to recover from the second. A production-grade
+answer would need either redpanda-side tuning to stop this
+health-subsystem wedge from happening (tying back to the per-shard
+memory root cause), or an external supervisor that checks actual
+health — not just process liveness — and forces a harder recreation
+when a container is unhealthy past some threshold. Neither exists
+here; recorded as the honest current state, not a fix.

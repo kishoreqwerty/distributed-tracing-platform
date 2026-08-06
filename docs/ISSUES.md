@@ -1340,3 +1340,46 @@ stats` directly during every load-test step and records peak usage
 per container into `scripts/load_test_results/*.jsonl` (see
 `docs/BENCHMARKS.md`) — it just isn't available as a live, continuous
 Grafana time series the way the other five dashboard panels are.
+
+### `restart: unless-stopped` brings the process back, not necessarily the service — redpanda got stuck permanently unhealthy after one overload cycle
+
+**Symptom:** deliverable 6's overload-then-recover test drove 40,000
+spans/sec for 90s, then dropped to 5,000 spans/sec — a rate confirmed
+stable five separate times earlier in this phase — for 5 minutes.
+Zero spans published, zero consumed, for the entire 5-minute recovery
+window. Checked again a full minute after the test ended: still zero
+activity, still broken.
+
+**Root cause:** unlike the soak's crash-loop pattern (repeated
+restarts, each one a real seastar abort), this time redpanda
+genuinely came back up — `docker inspect ... RestartCount` showed only
+3 restarts total, and `State.Running` was `true` throughout the dead
+window, no crash-looping. But `State.Health.Status` stayed
+`unhealthy` indefinitely, `FailingStreak` climbing continuously (40,
+then 43 a minute later), and `rpk cluster health` reported `Healthy:
+false, Unhealthy reasons: [no_health_report]` — on a **single-node**
+cluster, which should never need another node's report to know its
+own health. Redpanda's own logs: `unable to get health report -
+Timeout occurred while processing request` and `timed out when
+refreshing cluster health state`, repeating every ~10s with no sign of
+resolving on its own. The node's internal health-monitoring subsystem
+was timing out talking to itself — plausibly the same per-shard
+resource exhaustion already confirmed elsewhere in this phase (a shard
+too starved to service its own internal RPCs is also too starved to
+service produce requests), but this time leaving the process in a
+*wedged*, not crashed, state that a process-liveness restart policy
+has no way to detect or fix.
+
+**Not fixed — this is the honest limit of what `restart:
+unless-stopped` alone can do, documented rather than papered over.**
+Docker's restart policies operate on process exit, not on service
+health; a container that never exits but also never becomes useful
+again looks identical to a healthy one from the one signal Docker
+itself acts on. The only recovery observed was a full manual
+`docker compose up --force-recreate`, not a wait of any length. A real
+fix needs something that acts on the `unhealthy` healthcheck status
+specifically (an external supervisor forcing recreation past some
+failing-streak threshold, or redpanda-side tuning to stop the
+health-subsystem wedge from happening in the first place) — neither
+built here. See `docs/BENCHMARKS.md`'s recovery section for the full
+timeline and evidence.
