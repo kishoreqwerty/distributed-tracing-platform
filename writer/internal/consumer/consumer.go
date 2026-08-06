@@ -201,6 +201,14 @@ func (c *Consumer) flush(ctx context.Context) {
 	c.metrics.FlushDuration.Observe(time.Since(start).Seconds())
 	c.metrics.BatchSize.Observe(float64(len(rows)))
 
+	insertedAt := time.Now()
+	for _, row := range rows {
+		age := insertedAt.Sub(time.Unix(0, row.EndTimeUnixNano)).Seconds()
+		if age >= 0 {
+			c.metrics.SpanAge.Observe(age)
+		}
+	}
+
 	commitCtx := ctx
 	if ctx.Err() != nil {
 		commitCtx = context.Background()
