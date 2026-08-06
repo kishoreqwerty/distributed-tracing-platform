@@ -832,3 +832,84 @@ that rate is reaching it because the size cap stopped it, not because
 the timer happened to land there. That's a reasoned inference from the
 arrival-rate arithmetic, not a directly-measured fact this histogram's
 fixed bucket boundaries can confirm on their own.
+
+### 30-minute soak at 70% of the observed breaking point
+
+**The headline result: 28,000 spans/sec is not a stable, sustainable
+rate on this hardware, despite being well under the ramp's own
+40,000 spans/sec failure point.** `scripts/run_load_test.sh single
+28000 1800`, clean ClickHouse state at the start, a parallel monitor
+(`scripts/soak_monitor.sh`) sampling every 5 minutes throughout —
+`scripts/load_test_results/soak_timeline.jsonl`.
+
+| Elapsed | Published/sec | Consumed/sec | ClickHouse parts | Active merges | Consumer lag (total) |
+|---|---|---|---|---|---|
+| 0s | 4,313.7 | 4,589.8 | 45 | 0 | 1,754 |
+| 5m | 1,717.1 | 1,268.6 | 78 | 1 | 971 |
+| 10m | **0** | **0** | 84 | 0 | 971 |
+| 15m | **0** | **0** | 73 | 0 | 971 |
+| 20m | **0** | **0** | 91 | 1 | 971 |
+| 25m | **0** | **0** | 95 | 0 | 971 |
+| 30m | **0** | **0** | 91 | 0 | 971 |
+
+**The pipeline was completely down — zero spans published, zero
+consumed — for 20 of the 30 minutes**, from the 10-minute mark
+onward. Consumer lag reading exactly `971` at every sample from 5
+minutes on isn't stability; it's the gauge frozen at its last real
+value because nothing was moving on either side of it to change it.
+ClickHouse's own part count barely moved (45 to a peak of 95, ending
+at 91) specifically *because* so little of the 30 minutes had any real
+throughput to produce parts from — this run never got anywhere near
+testing whether merges keep pace with sustained insert volume, the
+thing this deliverable actually set out to watch.
+
+**Root cause, read directly from container state:** `docker inspect
+deploy-redpanda-1 --format '{{.RestartCount}}'` reports **8** — redpanda
+crashed and was auto-restarted (the fix from earlier in this phase —
+without it, this soak would have ended in a permanent outage 2 minutes
+in and stayed there) eight separate times over the 30 minutes, each
+one the same seastar internal memory-pool abort already confirmed and
+explained above: 15 visible CPUs inside a container cgroup-limited to
+3 means seastar auto-detects 15 shards and splits its ~1.934GiB budget
+into ~129MB slices, and produce load concentrated on however many
+shards actually carry this topic's 4 partitions exhausts those
+specific slices independent of the container's own aggregate memory
+staying well under its 2GB limit (peak observed here: 544.5MiB, 26.6%
+of the limit — consistent with every earlier observation of this same
+mechanism). **This is the same limitation identified after the ramp,
+now shown to bite at sustained load 30% below the rate that caused
+outright collapse in a 2-minute ramp step**, not a new, separate
+problem.
+
+**A second, compounding instability:** the analyzer independently
+restarted **32 times** over the same 30 minutes (`docker inspect
+deploy-analyzer-1 --format '{{.RestartCount}}'`), peaking at 82.96% of
+its own 512MB limit — consistent with the analyzer's own, earlier-
+identified breaking point (around/before 20,000 spans/sec, found
+during the ramp) being crossed repeatedly here too.
+
+**What this revises about "the breaking point":** the ramp's own
+2-minute-per-step holds found the write path stable through 20,000 and
+collapsing between 20,000-40,000, and this soak was designed as "70%
+of that" on the reasonable assumption that a rate the ramp called
+stable-adjacent would sustain. It didn't. **A rate that comfortably
+passes a 2-minute ramp step is not the same claim as a rate that
+survives 30 minutes** — this system's real, sustainable ceiling is
+meaningfully lower than the ramp alone suggested, likely at or below
+20,000 spans/sec, which itself was never tested for anything longer
+than 2 minutes and so still isn't confirmed stable at sustained
+duration either. Reported as found, not re-run at a lower rate to
+produce a calmer-looking result: a soak that reveals its own target
+rate was wrong is a more informative outcome than one that quietly
+wasn't, and matches this phase's own instruction to report bad
+results as measured. A follow-up soak at a meaningfully more
+conservative rate (perhaps half of 20,000) would be the natural next
+step to actually find a duration-stable ceiling, not yet run.
+
+**One thing the restart policy fix (earlier in this phase) changed
+about this result, worth being explicit about:** without it, this
+soak would have shown one crash at minute 2 and a flat, permanent
+zero for the remaining 28 minutes — a less informative result than
+what actually happened, where repeated auto-recovery let real
+(if degraded, ~40% successful) throughput continue intermittently and
+made the true failure *rate*, not just its existence, measurable.
