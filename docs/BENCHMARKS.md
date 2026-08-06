@@ -43,7 +43,7 @@ a single baseline run: `loadgen --target collector:4317 --rate 100
   measured — would need a per-span emit timestamp threaded through to a
   ClickHouse query, which nothing here currently does.
 
-### Known gap: the size-triggered flush path is untested end to end
+### Known gap: the size-triggered flush path is untested end to end (closed — see Phase 6)
 
 `WRITER_BATCH_MAX_SIZE` defaults to 5,000 rows and `WRITER_FLUSH_INTERVAL`
 to 2 seconds. For the size bound to ever fire *before* the time bound,
@@ -789,3 +789,46 @@ about its own internal memory pool/allocator hitting a wall, not
 simply the container's total RSS crossing 100% of `mem_limit`. Worth
 knowing before assuming a memory bump would behave predictably, but
 not independently investigated further here.
+
+### The size-triggered flush path, closing Phase 1's known gap
+
+Phase 1's own baseline run (397 spans/sec) never saw a size-triggered
+flush — every one of its 10 flushes was time-triggered, and that
+section's own math predicted the crossover needed **2,500 spans/sec**
+sustained (5,000 rows ÷ 2s) before the size bound could ever fire
+before the timer. The ramp gives an end-to-end answer, computed from
+`writer_batch_size`'s cumulative histogram, marginal per step (each
+step's own new flushes, not the running total):
+
+| Offered (spans/sec) | New flushes this step | In (2500, 5000] — size-cap range | Trigger split |
+|---|---|---|---|
+| 500 | 39 | 0 (0%) | entirely time-triggered |
+| 1,000 | 40 | 21 (52.5%) | crossing over |
+| 2,500 | 61 | 59 (96.7%) | overwhelmingly size-triggered |
+| 5,000 | 121 | 120 (99.2%) | overwhelmingly size-triggered |
+| 10,000 | 600 | 598 (99.7%) | overwhelmingly size-triggered |
+| 20,000 | 468 | 467 (99.8%) | overwhelmingly size-triggered |
+| 40,000 | 141 | 141 (100.0%) | entirely size-triggered |
+
+**The crossover lands almost exactly where Phase 1's math said it
+would** — between 1,000 and 2,500 spans/sec, with 2,500 already
+overwhelmingly on the size-triggered side. Every single flush across
+the entire ramp, at every rate, landed at or under the 5,000-row cap
+(the histogram's `le=5000`, `le=10000`, and `le=+Inf` cumulative
+counts are identical at every step — nothing ever exceeded it) —
+`WRITER_BATCH_MAX_SIZE`'s bound holds under real, sustained,
+high-concurrency load, not just in `batcher.TestAddTriggersFlushAtMaxSize`'s
+unit test.
+
+**One thing this histogram's resolution can't distinguish and is worth
+being precise about:** the top bucket is "landed somewhere in
+(2,500, 5,000]," not "landed at exactly 5,000" — a flush that filled to
+4,800 rows before the 2-second timer happened to fire would count the
+same as one that hit the hard cap exactly. At the higher rates this
+distinction stops mattering in practice: at 40,000 spans/sec, 5,000
+rows arrive in 0.125s — sixteen times faster than the 2-second timer
+could ever intervene — so a batch reaching anywhere near that range at
+that rate is reaching it because the size cap stopped it, not because
+the timer happened to land there. That's a reasoned inference from the
+arrival-rate arithmetic, not a directly-measured fact this histogram's
+fixed bucket boundaries can confirm on their own.
