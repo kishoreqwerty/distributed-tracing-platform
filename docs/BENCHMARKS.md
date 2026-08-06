@@ -738,3 +738,54 @@ to some higher offered rate. It was deliberately not done — see
 collector its own independent concurrency bound, decoupled from
 whatever memory happens to be configured. The tuning result against
 that fix is below.
+
+### Tuning result: one variable changed — the collector's admission bound
+
+Re-ran the identical 40,000 spans/sec, 120s step twice more, changing
+only `collector/internal/admission`'s concurrency bound (see
+`docs/ISSUES.md`) — redpanda's own 2GB memory limit, the primary
+trigger, was deliberately left untouched. The first re-run (a
+same-container redeploy, `single-1786033950.jsonl`) reused a redpanda
+process that had been running continuously for 11 hours across every
+earlier ramp and variance run in this phase; it crashed 2 seconds into
+the step instead of ~2 minutes, an unfair comparison muddied by
+accumulated redpanda state, not the collector change. Discarded in
+favor of a second, clean re-run against a freshly-recreated stack
+(fresh redpanda, restart policy confirmed live before starting):
+
+| | Original (no admission bound) | Tuned (admission bound added) |
+|---|---|---|
+| Successful sends | 707,521 | **2,998,361** (+324%) |
+| Failed sends | 705,799 (49.9%) | 279,135 (8.5%) |
+| Published vs. consumed, while up | — (total collapse) | 25,198.4/s vs. 25,053.6/s (99.4%, kept pace) |
+| Collector container | `OOMKilled: true`, stayed down | **Never exited** — `FinishedAt` stayed the zero value the entire step |
+| Collector peak memory | 511.8MiB / 512MiB (99.95%) | **24.4MiB / 512MiB (4.8%)** |
+| Redpanda | `Exited (133)`, seastar abort, stayed down | `Exited (133)`, same seastar abort (**untouched variable — expected**), auto-restarted in ~1s |
+| System state after the step | Fully down, needed manual restart | Recovered on its own |
+
+`collector_requests_rejected_total` read 185 at the end of the run —
+the new bound really did fire, but it's a small number next to the
+underlying `buffer_full` count (11,246/s while redpanda was down):
+most of this step's failures still went through the pre-existing,
+Phase-1 Kafka-producer semaphore's fast-reject path, which was never
+the broken part. The new bound's job was narrower and it did exactly
+that job — the collector's own memory now stays flat regardless of
+what the broker is doing, instead of growing until something kills it.
+
+**Redpanda still crashes at this rate, on schedule** — confirming the
+experiment isolated its one changed variable correctly rather than
+accidentally fixing (or breaking) something else. Its own memory
+ceiling remains this system's actual, unaddressed limit; what changed
+is that hitting it is no longer a chain reaction. Collector CPU peaked
+at 171% of its 150% (1.5-core) budget during the tuned run — a new,
+secondary thing worth watching if this bound is ever raised
+substantially past 256.
+
+One more thing observed, not chased down: redpanda's peak memory in
+the tuned run's `docker stats` reading was only 539.8MiB of its 2GB
+limit (26%) at the moment it aborted — well under the configured cgroup
+ceiling. `seastar`'s "Failed to allocate N bytes" abort is evidently
+about its own internal memory pool/allocator hitting a wall, not
+simply the container's total RSS crossing 100% of `mem_limit`. Worth
+knowing before assuming a memory bump would behave predictably, but
+not independently investigated further here.
