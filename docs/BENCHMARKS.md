@@ -979,3 +979,35 @@ memory root cause), or an external supervisor that checks actual
 health — not just process liveness — and forces a harder recreation
 when a container is unhealthy past some threshold. Neither exists
 here; recorded as the honest current state, not a fix.
+
+### Recovery: writer restart under load — the one clean result in this section
+
+**No span loss, clean rebalance.** 2 parallel loadgen processes at
+~2,500 spans/sec each (~5,000 spans/sec total, the same confirmed-
+stable rate used above) for 240s; `docker restart deploy-writer-1` at
+the 110s midpoint, load continuing for the remaining ~130s after.
+
+| | |
+|---|---|
+| Spans sent (loadgen aggregate, both processes) | 1,195,244 |
+| Send failures | 0 |
+| Rows landed in ClickHouse (`SELECT count() FROM tracing.spans`) | **1,195,244** — exact match |
+| Consumer lag, all 4 partitions, 30s after load ended | **0, 0, 0, 0** |
+
+This is the one recovery scenario in this deliverable that worked
+exactly as the pipeline's own design promises: `writer/internal/
+consumer`'s flush loop never commits Kafka offsets until the
+ClickHouse insert has actually succeeded (Phase 1's own design,
+previously verified only against a clean ClickHouse *outage* — see
+that phase's backpressure test). A mid-load writer restart forces
+exactly the code path that guarantee depends on — an in-flight batch
+whose offsets were never committed gets redelivered to whichever
+consumer picks up the partition after rebalance, here the same writer
+process once it came back — and it held under real concurrent load
+from two independent producers, not just a single-threaded test
+scenario. `docker inspect deploy-writer-1 --format '{{.RestartCount}}'`
+reads `0` despite the restart genuinely happening (confirmed directly
+in the test's own log, "writer restart command returned") — that
+field only counts restarts triggered by the restart *policy* after a
+crash, not a manual `docker restart`, a Docker API detail worth not
+misreading as "the restart didn't happen."
