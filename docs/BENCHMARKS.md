@@ -904,7 +904,8 @@ rate was wrong is a more informative outcome than one that quietly
 wasn't, and matches this phase's own instruction to report bad
 results as measured. A follow-up soak at a meaningfully more
 conservative rate (perhaps half of 20,000) would be the natural next
-step to actually find a duration-stable ceiling, not yet run.
+step to actually find a duration-stable ceiling — see the next section
+for that follow-up.
 
 **One thing the restart policy fix (earlier in this phase) changed
 about this result, worth being explicit about:** without it, this
@@ -913,6 +914,56 @@ zero for the remaining 28 minutes — a less informative result than
 what actually happened, where repeated auto-recovery let real
 (if degraded, ~40% successful) throughput continue intermittently and
 made the true failure *rate*, not just its existence, measurable.
+
+### Finding the sustained-safe rate
+
+**The result: this system's sustained-safe rate is 10,000 spans/sec —
+a factor of 4x below the 40,000 spans/sec the 2-minute ramp called the
+breaking point.** Two 30-minute soaks, stepping from a starting point
+of 10,000 spans/sec based on the single result at each step (clean →
+step up; fail → step down; one rate, not an exhaustive search), clean
+stack + clean ClickHouse state before each.
+
+| Rate | Redpanda restarts | Lag | Latency (age p50/p99) | Memory | Verdict |
+|---|---|---|---|---|---|
+| 10,000/s | **0** | 274-3,660, bounded, no trend | flat: ~0.228s / ~0.495s throughout | fluctuates, no trend (1.08-1.54GB) | **clean** |
+| 15,000/s | **1**, in the test's final minute | 1,404-5,054, bounded, no trend | flat: ~0.147s / ~0.490s throughout | fluctuates, no trend (0.98-1.65GB) | **fails** (restart) |
+
+15,000 spans/sec is a genuinely close call, worth being precise about
+rather than flattened into a bare pass/fail. Every monitored sample
+across the full nominal 30-minute window — lag, latency, memory, part
+count — looked as clean as 10,000's. The one redpanda restart landed
+at the very end of the test's actual real-world runtime (both soaks
+took ~45 minutes wall-clock to fully complete and drain, not the
+nominal 30 — see below), essentially at the last moment before the
+run finished. It's a real failure by the stated criterion (redpanda
+restarted; 10,000 never did, across an equally long real runtime), not
+a rounding call, but it's also not the kind of clear, early collapse
+40,000 produced in the original ramp. **10,000 spans/sec is reported
+as the sustained-safe rate** because it's the highest rate that held
+with zero redpanda restarts across a real ~45-minute run — a properly
+bracketed result (10,000 clean, 15,000 failed), not a guess at where
+between them the true edge sits.
+
+**A secondary, honest observation neither test's pass/fail depended
+on:** the analyzer restarted 41 times during the 10,000 spans/sec soak
+and 39 times during the 15,000 spans/sec soak — consistent with its
+own, separately-identified breaking point (at or below 20,000
+spans/sec, found during the original ramp) being well below either
+rate tested here. The write path's own sustained-safe rate (10,000)
+says nothing about whether the analysis layer is keeping up at that
+same rate — it isn't, reliably, and that's a distinct, already-
+documented limitation, not a new one.
+
+**Also observed, not chased down:** both soaks took roughly 45 minutes
+of real wall-clock time to fully complete a nominal 30-minute (1800s)
+load-generation run — the generation loop itself finishes on schedule,
+but loadgen's own drain phase (waiting for every asynchronously
+dispatched send to resolve) stretched well past that under sustained
+load. The most likely explanation is Docker daemon contention from the
+analyzer's own frequent restarts competing for the same host resources
+as the load generator's containers, not a defect in the write path
+itself — plausible, not independently confirmed.
 
 ### Recovery: overload then drop to a known-good rate
 

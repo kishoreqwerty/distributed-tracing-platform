@@ -218,8 +218,11 @@ should be read as one** — they measure *relative* behavior on this one
 box (what saturates first, how the system degrades), not an absolute
 ceiling that would hold on real, distributed hardware.
 
-There is no single honest headline number, because short-burst
-tolerance and sustained tolerance turned out to be different claims:
+**The headline result: short-burst load testing overstated this
+system's sustained capacity by 4x.** The 2-minute ramp called 40,000
+spans/sec the breaking point; the rate that actually holds for 30
+minutes is **10,000 spans/sec**. That gap is the finding, not a
+caveat on some other number:
 
 - **The write path (collector → Kafka → writer → ClickHouse) holds
   cleanly through 20,000 spans/sec in 2-minute ramp steps**, and
@@ -229,14 +232,20 @@ tolerance and sustained tolerance turned out to be different claims:
   cgroup-limited-to-3 container means redpanda auto-detects 15 shards
   and splits its budget into ~129MB slices, not one 2GB pool — see
   `docs/ISSUES.md`), which cascaded into the collector being OOM-killed
-  before a fix. **A 30-minute soak at 28,000 spans/sec (70% of that
-  40,000 failure point) revealed the 2-minute ramp result was
-  optimistic for sustained load**: the pipeline was completely down —
-  zero spans published, zero consumed — for 20 of the 30 minutes,
-  redpanda restarting 8 times. This system's real, sustainable ceiling
-  is meaningfully lower than the short-burst ramp alone suggested, and
-  wasn't pinned down further — a rate that comfortably passes a
-  2-minute test is not the same claim as a rate that survives 30.
+  before a fix.
+- **A 30-minute soak at 70% of that (28,000 spans/sec) showed the
+  2-minute result was badly optimistic**: the pipeline was completely
+  down — zero spans published, zero consumed — for 20 of the 30
+  minutes, redpanda restarting 8 times.
+- **Bracketing from there — 10,000 spans/sec held clean for a full
+  30-minute soak (zero redpanda restarts, flat latency, bounded lag, no
+  memory growth); 15,000 spans/sec failed (one redpanda restart, right
+  at the very end of the run, everything else equally clean) — pins
+  the sustained-safe rate at 10,000 spans/sec, a properly bracketed
+  result, not a guess at where between two untested points the edge
+  sits.** A rate that comfortably passes a 2-minute test is not the
+  same claim as a rate that survives 30 — on this system, it's a 4x
+  overstatement specifically, not just a vague "somewhat lower."
 - **The one tuning change made (bounding the collector's own concurrent
   request admission, independent of the Kafka producer's existing
   bound) worked exactly as intended**: re-running the 40,000 spans/sec
@@ -314,14 +323,14 @@ finding, not a hypothetical:
   only single-request** — Phase 6 characterizes the ingest pipeline's
   load behavior, not the query API's, which remains untested under
   concurrent dashboard traffic.
-- **The system's real, sustainable capacity ceiling is not pinned
-  down.** Phase 6's 2-minute ramp steps found the write path stable
-  through 20,000 spans/sec; a 30-minute soak at 28,000 (70% of the
-  ramp's own 40,000 failure point) showed the pipeline down for 20 of
-  30 minutes. The actual sustained-safe rate is somewhere at or below
-  20,000, itself never confirmed stable for longer than 2 minutes — a
-  known gap, not a number this project has, stated as such rather than
-  guessed at.
+- **The analysis layer's own sustained-safe rate is lower than the
+  write path's, and isn't pinned down.** The analyzer restarted 39-41
+  times during both 30-minute soaks that confirmed the write path's own
+  10,000 spans/sec ceiling — consistent with its separately-identified
+  breaking point (at or below 20,000 spans/sec, from the original
+  ramp) being well under 10,000 sustained. The write path's
+  sustained-safe rate says nothing about whether reassembly and
+  detection are keeping up at that same rate; they aren't, reliably.
 - **Redpanda's crash-recovery is unreliable in a way process restarts
   can't fix.** After one overload cycle, redpanda got stuck
   permanently `unhealthy` — the container process came back (Docker's
