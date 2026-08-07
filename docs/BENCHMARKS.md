@@ -234,7 +234,12 @@ At 1/5/10% no service actually got skewed by the fault injector
 (`--clock-skew-rate` decides per-service, independently, once per run —
 at low rates the random draw came up clean for every service in all
 three runs). Ground truth for every service at those three rates is
-exactly 0. And yet the estimator reports ~51ms of drift for
+exactly 0. Reproduce: these are 3 of the 17 points driven by
+`scripts/run_sweep.sh` (`--rate 100 --duration 35s
+--clock-skew-rate 0.01/0.05/0.10/0.25`, one point per rate, default
+`--clock-skew-max-offset` of 2s throughout — see "Fault sweep" above
+for the full sweep's own methodology); raw per-point data including
+each point's `run_id` is in `scripts/sweep_results.jsonl`. And yet the estimator reports ~51ms of drift for
 `notifications` and `shipping` and ~13ms for `payments` in every single
 one of those three runs, with the magnitude essentially unchanged
 (51.15-51.58ms, 12.90-13.02ms) regardless of rate. That rules out random
@@ -741,8 +746,9 @@ that fix is below.
 
 ### Tuning result: one variable changed — the collector's admission bound
 
-Re-ran the identical 40,000 spans/sec, 120s step twice more, changing
-only `collector/internal/admission`'s concurrency bound (see
+Re-ran the identical 40,000 spans/sec, 120s step twice more (`./scripts/
+run_load_test.sh single 40000 120 <label>`), changing only
+`collector/internal/admission`'s concurrency bound (see
 `docs/ISSUES.md`) — redpanda's own 2GB memory limit, the primary
 trigger, was deliberately left untouched. The first re-run (a
 same-container redeploy, `single-1786033950.jsonl`) reused a redpanda
@@ -751,7 +757,10 @@ earlier ramp and variance run in this phase; it crashed 2 seconds into
 the step instead of ~2 minutes, an unfair comparison muddied by
 accumulated redpanda state, not the collector change. Discarded in
 favor of a second, clean re-run against a freshly-recreated stack
-(fresh redpanda, restart policy confirmed live before starting):
+(fresh redpanda, restart policy confirmed live before starting,
+`single-1786034218.jsonl`). The "Original" column below is the
+pre-tuning 40,000 spans/sec ramp step itself — same figures as the
+ramp table above, `scripts/load_test_results/ramp-1785993646.jsonl`:
 
 | | Original (no admission bound) | Tuned (admission bound added) |
 |---|---|---|
@@ -928,15 +937,32 @@ bounds this system:**
 
 The write path's sustained-safe rate is 10,000 spans/sec — a factor of
 4x below the 40,000 spans/sec the 2-minute ramp called the breaking
-point. Two 30-minute soaks, stepping from a starting point of 10,000
-spans/sec based on the single result at each step (clean → step up;
-fail → step down; one rate, not an exhaustive search), clean stack +
-clean ClickHouse state before each.
+point. Reproduce: fresh stack (`docker compose ... up -d
+--force-recreate`), `./scripts/run_load_test.sh clean`, then
+`./scripts/run_load_test.sh single 10000 1800 <label>` (10,000
+spans/sec) or `single 15000 1800 <label>` (15,000) — one variable
+(rate) changed between the two, clean ClickHouse state before each,
+same `deploy/docker-compose.load.yml` resource limits as the rest of
+this phase. Raw records: `scripts/load_test_results/single-1786053848.jsonl`
+(10,000) and `single-1786056622.jsonl` (15,000) for the harness's own
+before/after/peak snapshot; `soak_10k_timeline.jsonl` and
+`soak_15k_timeline.jsonl` for the 5-minute-interval drift samples in
+the table below.
 
-| Rate | Redpanda restarts | Lag | Latency (age p50/p99) | Memory | Verdict |
-|---|---|---|---|---|---|
-| 10,000/s | **0** | 274-3,660, bounded, no trend | flat: ~0.228s / ~0.495s throughout | fluctuates, no trend (1.08-1.54GB) | **clean** |
-| 15,000/s | **1**, in the test's final minute | 1,404-5,054, bounded, no trend | flat: ~0.147s / ~0.490s throughout | fluctuates, no trend (0.98-1.65GB) | **fails** (restart) |
+| Rate | Sent / failed (loadgen aggregate) | Redpanda restarts | Lag | Latency (age p50/p99) | Memory | Verdict |
+|---|---|---|---|---|---|---|
+| 10,000/s | 17,549,420 / 3,131 (0.018% failed) | **0** | 274-3,660, bounded, no trend | flat: ~0.228s / ~0.495s throughout | fluctuates, no trend (1.08-1.54GB) | **clean** |
+| 15,000/s | 25,818,838 / 29,668 (0.115% failed) | **1**, in the test's final minute | 1,404-5,054, bounded, no trend | flat: ~0.147s / ~0.490s throughout | fluctuates, no trend (0.98-1.65GB) | **fails** (restart) |
+
+**Correction to how this gets summarized: 10,000 spans/sec sustained
+is not zero-span-loss** — 3,131 of 17,552,551 attempted sends failed
+(0.018%), a real, small, nonzero number, and worth being precise about
+since a separate result in this same deliverable (the writer-restart
+recovery test, below) *did* achieve an exact, zero-loss row-count
+match and it would be easy to conflate the two. "Clean" here means the
+verdict criteria that actually gate this rate — no redpanda restarts,
+bounded lag, flat latency, no memory growth — not that literally
+every send succeeded.
 
 15,000 spans/sec is a genuinely close call, worth being precise about
 rather than flattened into a bare pass/fail. Every monitored sample
