@@ -917,12 +917,21 @@ made the true failure *rate*, not just its existence, measurable.
 
 ### Finding the sustained-safe rate
 
-**The result: this system's sustained-safe rate is 10,000 spans/sec —
-a factor of 4x below the 40,000 spans/sec the 2-minute ramp called the
-breaking point.** Two 30-minute soaks, stepping from a starting point
-of 10,000 spans/sec based on the single result at each step (clean →
-step up; fail → step down; one rate, not an exhaustive search), clean
-stack + clean ClickHouse state before each.
+**Three figures, not one, and the third is the one that actually
+bounds this system:**
+
+| | Rate | Status |
+|---|---|---|
+| Ingest, short-burst (2-minute ramp) | 40,000 spans/sec | confirmed failure point |
+| Ingest, sustained (30-minute soak) | 10,000 spans/sec | confirmed sustained-safe |
+| Analysis (reassembly/detection), sustained | **not established** | fails at every rate tested, including 10,000 |
+
+The write path's sustained-safe rate is 10,000 spans/sec — a factor of
+4x below the 40,000 spans/sec the 2-minute ramp called the breaking
+point. Two 30-minute soaks, stepping from a starting point of 10,000
+spans/sec based on the single result at each step (clean → step up;
+fail → step down; one rate, not an exhaustive search), clean stack +
+clean ClickHouse state before each.
 
 | Rate | Redpanda restarts | Lag | Latency (age p50/p99) | Memory | Verdict |
 |---|---|---|---|---|---|
@@ -945,15 +954,21 @@ with zero redpanda restarts across a real ~45-minute run — a properly
 bracketed result (10,000 clean, 15,000 failed), not a guess at where
 between them the true edge sits.
 
-**A secondary, honest observation neither test's pass/fail depended
-on:** the analyzer restarted 41 times during the 10,000 spans/sec soak
-and 39 times during the 15,000 spans/sec soak — consistent with its
-own, separately-identified breaking point (at or below 20,000
-spans/sec, found during the original ramp) being well below either
-rate tested here. The write path's own sustained-safe rate (10,000)
-says nothing about whether the analysis layer is keeping up at that
-same rate — it isn't, reliably, and that's a distinct, already-
-documented limitation, not a new one.
+**This system's usable end-to-end throughput is bounded by the
+analysis layer, not ingest — and that bound was not pinned down.** The
+analyzer restarted 41 times during the 10,000 spans/sec soak and 39
+times during the 15,000 spans/sec soak — meaning it was already
+failing repeatedly *at the rate ingest itself calls sustained-safe*,
+not just at the higher rate tested alongside it. 10,000 spans/sec is
+an honest answer to "how much can the write path absorb without
+falling over," but it overstates what this system can actually do
+end to end: reassembly and detection were never observed holding
+stable at any rate tested in this deliverable, 10,000 included. No
+soak was run specifically to bracket the analyzer's own ceiling the
+way ingest's was (a lower starting point, stepping down until it
+holds) — this is reported as a real, load-bearing gap in what Phase 6
+established, not estimated or rounded to a number that wasn't
+actually measured.
 
 **Also observed, not chased down:** both soaks took roughly 45 minutes
 of real wall-clock time to fully complete a nominal 30-minute (1800s)

@@ -219,10 +219,18 @@ box (what saturates first, how the system degrades), not an absolute
 ceiling that would hold on real, distributed hardware.
 
 **The headline result: short-burst load testing overstated this
-system's sustained capacity by 4x.** The 2-minute ramp called 40,000
-spans/sec the breaking point; the rate that actually holds for 30
-minutes is **10,000 spans/sec**. That gap is the finding, not a
-caveat on some other number:
+system's sustained capacity by 4x — and even that overstates what the
+system can usably do end to end.** Three figures, not one:
+
+| | Rate | Status |
+|---|---|---|
+| Ingest, short-burst (2-minute ramp) | 40,000 spans/sec | confirmed failure point |
+| Ingest, sustained (30-minute soak) | 10,000 spans/sec | confirmed sustained-safe |
+| Analysis (reassembly/detection), sustained | **not established** | fails at every rate tested, including 10,000 |
+
+That gap between the first two is the finding, not a caveat on some
+other number. The third row is why the first two aren't the end of
+the story:
 
 - **The write path (collector → Kafka → writer → ClickHouse) holds
   cleanly through 20,000 spans/sec in 2-minute ramp steps**, and
@@ -246,6 +254,16 @@ caveat on some other number:
   sits.** A rate that comfortably passes a 2-minute test is not the
   same claim as a rate that survives 30 — on this system, it's a 4x
   overstatement specifically, not just a vague "somewhat lower."
+- **This system's usable end-to-end throughput is bounded by the
+  analysis layer, not ingest, and that bound was not pinned down.**
+  The analyzer restarted 39-41 times during *every* 30-minute soak run
+  in this deliverable — including at 10,000 spans/sec, the rate ingest
+  itself holds cleanly. 10,000 spans/sec answers "how much can the
+  write path absorb," not "how much can this system actually process
+  end to end" — reassembly and detection were never observed holding
+  stable at any tested rate. No number is given for the analyzer's own
+  ceiling because none was measured; a soak stepping down from a lower
+  starting point would be needed to find one, and wasn't run.
 - **The one tuning change made (bounding the collector's own concurrent
   request admission, independent of the Kafka producer's existing
   bound) worked exactly as intended**: re-running the 40,000 spans/sec
@@ -323,14 +341,6 @@ finding, not a hypothetical:
   only single-request** — Phase 6 characterizes the ingest pipeline's
   load behavior, not the query API's, which remains untested under
   concurrent dashboard traffic.
-- **The analysis layer's own sustained-safe rate is lower than the
-  write path's, and isn't pinned down.** The analyzer restarted 39-41
-  times during both 30-minute soaks that confirmed the write path's own
-  10,000 spans/sec ceiling — consistent with its separately-identified
-  breaking point (at or below 20,000 spans/sec, from the original
-  ramp) being well under 10,000 sustained. The write path's
-  sustained-safe rate says nothing about whether reassembly and
-  detection are keeping up at that same rate; they aren't, reliably.
 - **Redpanda's crash-recovery is unreliable in a way process restarts
   can't fix.** After one overload cycle, redpanda got stuck
   permanently `unhealthy` — the container process came back (Docker's
